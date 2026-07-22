@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""mailbox — v2 inbox commands (standalone, no dotai dependency)
+
+Usage:
+  mailbox send --to <worker> --subject "..." --body "..."
+  mailbox check --worker <worker>
+  mailbox status --worker <worker> --state IDLE [--current-task "..."]
+  mailbox clear --worker <worker>
+  mailbox stats --worker <worker>
+"""
+
+import json, os, sys, argparse
+from pathlib import Path
+from datetime import datetime, timezone
+
+ROOT = Path(os.path.expanduser("$MAILBOX_ROOT"))
+VALID_STATES = {"IDLE", "BUSY", "DONE", "BLOCKED"}
+VALID_KINDS = {"TASK", "REPORT", "NOTICE"}
+
+
+def cmd_send(args):
+    inbox = ROOT / args.to / "inbox"
+    if not inbox.exists():
+        sys.exit(f"recipient not registered: {args.to}")
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    base_id = f"{args.from_worker}_{ts}"
+    msg_id = base_id
+    collision = 1
+    while (inbox / f"{msg_id}.json").exists():
+        msg_id = f"{base_id}-{collision}"; collision += 1
+    msg = {"from": args.from_worker, "to": args.to, "subject": args.subject,
+           "body": args.body, "kind": args.kind, "msg_id": msg_id,
+           "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+    dest = inbox / f"{msg_id}.json"
+    tmp = inbox / f".tmp-{msg_id}.json"
+    tmp.write_text(json.dumps(msg, indent=2, ensure_ascii=False))
+    os.replace(str(tmp), str(dest))
+    print(f"sent → {args.to}/inbox/{msg_id}.json")
+
+
+def cmd_check(args):
+    inbox = ROOT / args.worker / "inbox"
+    archive = ROOT / args.worker / "archive"
+    corrupt = ROOT / args.worker / "_corrupt"
+
+    if not inbox.exists():
+        return
+
+    files = sorted(
+        [f for f in inbox.glob("*.json")
+         if f.is_file() and not f.is_symlink()
+         and not f.name.startswith(".sync-conflict-")
+         and not f.name.startswith(".tmp-")],
+        key=lambda f: f.stat().st_mtime)
+
+    count = 0
+    for entry in files[:args.max_messages or len(files)]:
+        try:
+            msg = json.loads(entry.read_bytes())
+            if msg.get("msg_id","") + ".json" != entry.name:
+                raise ValueError("msg_id mismatch")
+        except (json.JSONDecodeError, ValueError) as e:
+            corrupt.mkdir(parents=True, exist_ok=True)
+            os.replace(str(entry), str(corrupt / entry.name))
+            print(f"CORRUPT: {entry.name} ({e})", file=sys.stderr)
+            continue
+
+        archive.mkdir(parents=True, exist_ok=True)
+        os.replace(str(entry), str(archive / entry.name))
+        count += 1
+
+        if args.json:
+            print(json.dumps(msg, ensure_ascii=False))
+        else:
+            print(f"FROM: {msg['from']}  KIND: {msg.get('kind','?')}")
+            print(f"SUBJECT: {msg['subject']}")
+            print(f"BODY: {msg['body']}")
+            print("---")
+
+    if args.max_messages and count >= args.max_messages:
+        remaining = len(list(inbox.glob("*.json")))
+        print(f"[+{remaining} more in inbox]", file=sys.stderr)
+
+
+def cmd_status(args):
+    if args.state not in VALID_STATES:
+        sys.exit(f"invalid state: {args.state}")
+    status = {
+        "state": args.state,
+        "current_task": args.current_task or "",
+        "last_conclusion": args.last_conclusion or "",
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    dest = ROOT / args.worker / "status.json"
+    tmp = ROOT / args.worker / ".tmp-status.json"
+    tmp.write_text(json.dumps(status, indent=2, ensure_ascii=False))
+    os.replace(str(tmp), str(dest))
+    print(f"status: {args.state}")
+
+
+def cmd_clear(args):
+    archive = ROOT / args.worker / "archive"
+    count = 0
+    if archive.exists():
+        for f in archive.glob("*.json"):
+            f.unlink(); count += 1
+    if args.prune_corrupt:
+        cdir = ROOT / args.worker / "_corrupt"
+        if cdir.exists():
+            cutoff = datetime.now().timestamp() - args.older_than_days * 86400
+            for f in cdir.glob("*.json"):
+                if f.stat().st_mtime < cutoff:
+                    f.unlink(); count += 1
+    print(f"cleared {count}")
+
+
+def cmd_stats(args):
+    for d in ["inbox", "archive", "_corrupt"]:
+        p = ROOT / args.worker / d
+        c = len(list(p.glob("*.json"))) if p.exists() else 0
+        print(f"{d}: {c}")
+
+
+def main():
+    p = argparse.ArgumentParser(description="mailbox v2 CLI (standalone)")
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("send")
+    s.add_argument("--from", required=True, dest="from_worker")
+    s.add_argument("--to", required=True)
+    s.add_argument("--subject", required=True)
+    s.add_argument("--body", required=True)
+    s.add_argument("--kind", default="REPORT", choices=VALID_KINDS)
+
+    c = sub.add_parser("check")
+    c.add_argument("--worker", required=True)
+    c.add_argument("--json", action="store_true")
+    c.add_argument("--max-messages", type=int, default=0)
+
+    st = sub.add_parser("status")
+    st.add_argument("--worker", required=True)
+    st.add_argument("--state", required=True, choices=sorted(VALID_STATES))
+    st.add_argument("--current-task", default="")
+    st.add_argument("--last-conclusion", default="")
+
+    cl = sub.add_parser("clear")
+    cl.add_argument("--worker", required=True)
+    cl.add_argument("--prune-corrupt", action="store_true")
+    cl.add_argument("--older-than-days", type=int, default=30)
+
+    ss = sub.add_parser("stats")
+    ss.add_argument("--worker", required=True)
+
+    args = p.parse_args()
+    if args.cmd == "send": cmd_send(args)
+    elif args.cmd == "check": cmd_check(args)
+    elif args.cmd == "status": cmd_status(args)
+    elif args.cmd == "clear": cmd_clear(args)
+    elif args.cmd == "stats": cmd_stats(args)
+    else: p.print_help()
+
+if __name__ == "__main__":
+    main()
