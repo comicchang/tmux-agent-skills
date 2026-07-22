@@ -12,6 +12,15 @@ python3 scripts/tmux_worker.py mailbox-v2-send \
   --from manager --to <worker-id> --kind TASK \
   --subject "<task>" --body "<full task + acceptance>"
 
+# 或直接用 standalone CLI（zero-dependency）
+MAILBOX_ROOT=_mailbox/tools mailbox send \
+  --from manager --to <worker-id> --kind TASK \
+  --subject "<task>" --body "<full task>"
+mailbox peek --worker <worker-id>       # 非消费查询
+mailbox check --worker <worker-id> --json  # 消费一消息
+mailbox claim --worker <worker-id> --msg-id <id>   # 独占认领
+mailbox release --worker <worker-id> --msg-id <id> # 释放认领
+
 # send-keys 只唤醒/steering
 tmux send-keys -t <target> -l -- "MAILBOX_PENDING; check v2 inbox"
 tmux send-keys -t <target> C-m
@@ -22,7 +31,9 @@ python3 scripts/tmux_worker.py mailbox-v2-stats --worker <id|manager>
 python3 scripts/tmux_worker.py mailbox-v2-clear --worker <id|manager>
 ```
 
-目录：`_mailbox/<id>/{inbox,archive,_corrupt}/`。Worker→Manager、Worker→Worker、Manager→Worker 正式内容全部 direct inbox；无 relay daemon、outbox、cursor。
+目录：`_mailbox/<id>/{inbox,archive,processing,_corrupt}/`。Worker→Manager、Worker→Worker、Manager→Worker 正式内容全部 direct inbox；无 relay daemon、outbox、cursor。
+7 种 kind：TASK, REPORT, PROGRESS, EVIDENCE, QUESTION, RESPONSE, NOTICE。
+竞态保护：`mailbox claim` → `processing/` → `mailbox check`；`mailbox release` 回放。
 
 ## Notification reachability
 
@@ -30,6 +41,12 @@ python3 scripts/tmux_worker.py mailbox-v2-clear --worker <id|manager>
 - Remote SSH Worker (`aosp`, `hyperos`, `ohos`): no local tmux socket; never use `send-keys` for Manager or peer communication. Mailbox-v2 + status.json polling is the complete communication path.
 - Manager polls each `status.json` plus `mailbox-v2-stats` inbox count every 5 seconds. A growing count is pending work, not a new status field. `BUSY` remains busy until the Worker updates status.
 - A successful local `send-keys` call proves neither delivery nor reading; only the mailbox file and later status/REPORT prove progress.
+
+## Plugin integration
+
+- `$OMP_WORKER_ID` must be set by the Worker launcher before OMP starts.
+- `omp-mailbox-plugin` uses `mailbox peek` + Bun.watch (30s timer fallback), dedups via `msg_id`.
+- Plugin is wake-only notification; Worker agent must still `mailbox claim → check` for consumption.
 
 ## Runner adapter mode
 
@@ -70,6 +87,7 @@ python3 scripts/tmux_worker.py mailbox-v2-status --worker <id> \
 - Worker：任务前、主要阶段后、final REPORT 前、终态后；本地看到 `MAILBOX_PENDING` 可立即检查，远程即使无提示也必须主动 poll。
 - Manager：派发前、等待循环、状态终态、每封消息处理后；同时看 status 和 inbox count。
 - 每次处理一封，直到 inbox 为空；处理完成才 clear archive。
+
 ## Errors / Prevention
 
 - `_corrupt/` 非空：记录并要求 sender 用 CLI 重发；不修 JSON。

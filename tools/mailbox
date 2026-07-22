@@ -1,27 +1,91 @@
 #!/usr/bin/env python3
 """mailbox — v2 inbox commands (standalone, no dotai dependency)
 
-Usage:
-  mailbox send --to <worker> --subject "..." --body "..."
-  mailbox check --worker <worker>
-  mailbox status --worker <worker> --state IDLE [--current-task "..."]
-  mailbox clear --worker <worker>
-  mailbox stats --worker <worker>
+Shared mailbox root via $MAILBOX_ROOT env or --root flag.
+Writes atomic JSON (tmp + os.replace). Syncthing-safe: rejects
+.sync-conflict-* and .tmp-* filenames.
+
+Commands:
+  send       Write message to recipient inbox (7 required fields)
+  peek       Non-consuming summary: pending count + message previews
+  check      Validate, archive consumed messages (idempotent with claim)
+  claim      Atomically claim a message for processing (→ processing/)
+  release    Release a claimed message back to inbox
+  status     Write 4-field status.json
+  clear      Delete archive (optionally prune _corrupt older than N days)
+  stats      Inbox/archive/corrupt counts
+
+Message JSON (7 required fields):
+  from, to, subject, body, kind, msg_id, created_at
+
+Kinds: TASK, REPORT, PROGRESS, EVIDENCE, QUESTION, RESPONSE, NOTICE
+States: IDLE, BUSY, DONE, BLOCKED
 """
 
 import json, os, sys, argparse
 from pathlib import Path
 from datetime import datetime, timezone
 
-ROOT = Path(os.path.expanduser("$MAILBOX_ROOT"))
+# Valid vocabulary — kept in sync with manager/SKILL.md
+VALID_KINDS = {"TASK", "REPORT", "PROGRESS", "EVIDENCE", "QUESTION", "RESPONSE", "NOTICE"}
 VALID_STATES = {"IDLE", "BUSY", "DONE", "BLOCKED"}
-VALID_KINDS = {"TASK", "REPORT", "NOTICE"}
+REQUIRED_FIELDS = {"from", "to", "subject", "body", "kind", "msg_id", "created_at"}
+
+
+def resolve_root():
+    """MAILBOX_ROOT env → ~/Dropbox/.../mi-docs/_mailbox (legacy default)."""
+    return Path(os.environ.get("MAILBOX_ROOT") or
+                os.path.expanduser("~/Dropbox/logseq/pages/mi-docs/_mailbox"))
+
+
+def validate_message(msg, expected_recipient, filename):
+    """Full schema validation. Returns (True, "") or (False, reason)."""
+    if not isinstance(msg, dict):
+        return False, "not a JSON object"
+
+    missing = REQUIRED_FIELDS - set(msg.keys())
+    if missing:
+        return False, f"missing fields: {', '.join(sorted(missing))}"
+
+    if msg["kind"] not in VALID_KINDS:
+        return False, f"invalid kind: {msg['kind']}"
+    if msg["msg_id"] + ".json" != filename:
+        return False, f"msg_id mismatch: {msg['msg_id']} vs {filename}"
+    if msg["to"] != expected_recipient:
+        return False, f"recipient mismatch: {msg['to']} vs {expected_recipient}"
+
+    # Sanity: no path traversal in msg_id
+    if "/" in msg["msg_id"] or "\\" in msg["msg_id"]:
+        return False, f"invalid msg_id (contains path separator): {msg['msg_id']}"
+
+    return True, ""
+
+
+def list_messages(inbox):
+    """Return sorted list of .json files in inbox (excludes tmp/conflict)."""
+    if not inbox.exists():
+        return []
+    return sorted(
+        [f for f in inbox.glob("*.json")
+         if f.is_file() and not f.is_symlink()
+         and not f.name.startswith(".sync-conflict-")
+         and not f.name.startswith(".tmp-")],
+        key=lambda f: f.stat().st_mtime)
 
 
 def cmd_send(args):
-    inbox = ROOT / args.to / "inbox"
+    root = resolve_root()
+    inbox = root / args.to / "inbox"
     if not inbox.exists():
         sys.exit(f"recipient not registered: {args.to}")
+
+    # Sender roster validation: sender must have an inbox directory
+    sender_inbox = root / args.from_worker / "inbox"
+    if not sender_inbox.exists():
+        sys.exit(f"sender not in roster: {args.from_worker}")
+
+    if args.kind not in VALID_KINDS:
+        sys.exit(f"invalid kind: {args.kind}")
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     base_id = f"{args.from_worker}_{ts}"
@@ -29,9 +93,12 @@ def cmd_send(args):
     collision = 1
     while (inbox / f"{msg_id}.json").exists():
         msg_id = f"{base_id}-{collision}"; collision += 1
+
     msg = {"from": args.from_worker, "to": args.to, "subject": args.subject,
            "body": args.body, "kind": args.kind, "msg_id": msg_id,
            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    if args.reply_to:
+        msg["reply_to"] = args.reply_to
 
     dest = inbox / f"{msg_id}.json"
     tmp = inbox / f".tmp-{msg_id}.json"
@@ -40,41 +107,67 @@ def cmd_send(args):
     print(f"sent → {args.to}/inbox/{msg_id}.json")
 
 
-def cmd_check(args):
-    inbox = ROOT / args.worker / "inbox"
-    archive = ROOT / args.worker / "archive"
-    corrupt = ROOT / args.worker / "_corrupt"
-
-    if not inbox.exists():
+def cmd_peek(args):
+    root = resolve_root()
+    inbox = root / args.worker / "inbox"
+    files = list_messages(inbox)
+    if not files:
+        json.dump({"pending": 0, "messages": []}, sys.stdout)
         return
 
-    files = sorted(
-        [f for f in inbox.glob("*.json")
-         if f.is_file() and not f.is_symlink()
-         and not f.name.startswith(".sync-conflict-")
-         and not f.name.startswith(".tmp-")],
-        key=lambda f: f.stat().st_mtime)
+    summaries = []
+    limit = min(len(files), args.max_messages or 5)
+    for f in files[:limit]:
+        try:
+            msg = json.loads(f.read_bytes())
+            summaries.append({
+                "from": msg.get("from", "?"),
+                "kind": msg.get("kind", "?"),
+                "subject": msg.get("subject", "")[:args.max_subject or 80],
+                "msg_id": msg.get("msg_id", f.stem),
+            })
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            summaries.append({"from": "?", "kind": "?", "subject": "(unreadable)",
+                              "msg_id": f.stem})
+
+    result = {"pending": len(files), "messages": summaries}
+    json.dump(result, sys.stdout, ensure_ascii=False)
+
+
+def cmd_check(args):
+    root = resolve_root()
+    worker_dir = root / args.worker
+    inbox = worker_dir / "inbox"
+    archive = worker_dir / "archive"
+    corrupt = worker_dir / "_corrupt"
+
+    files = list_messages(inbox)
+    if not files:
+        return
 
     count = 0
-    for entry in files[:args.max_messages or len(files)]:
+    limit = args.max_messages or len(files)
+    for entry in files[:limit]:
+        filename = entry.name
         try:
             msg = json.loads(entry.read_bytes())
-            if msg.get("msg_id","") + ".json" != entry.name:
-                raise ValueError("msg_id mismatch")
-        except (json.JSONDecodeError, ValueError) as e:
+            ok, reason = validate_message(msg, args.worker, filename)
+            if not ok:
+                raise ValueError(reason)
+        except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
             corrupt.mkdir(parents=True, exist_ok=True)
-            os.replace(str(entry), str(corrupt / entry.name))
-            print(f"CORRUPT: {entry.name} ({e})", file=sys.stderr)
+            os.replace(str(entry), str(corrupt / filename))
+            print(f"CORRUPT: {filename} ({e})", file=sys.stderr)
             continue
 
         archive.mkdir(parents=True, exist_ok=True)
-        os.replace(str(entry), str(archive / entry.name))
+        os.replace(str(entry), str(archive / filename))
         count += 1
 
         if args.json:
             print(json.dumps(msg, ensure_ascii=False))
         else:
-            print(f"FROM: {msg['from']}  KIND: {msg.get('kind','?')}")
+            print(f"FROM: {msg['from']}  KIND: {msg.get('kind', '?')}")
             print(f"SUBJECT: {msg['subject']}")
             print(f"BODY: {msg['body']}")
             print("---")
@@ -84,7 +177,48 @@ def cmd_check(args):
         print(f"[+{remaining} more in inbox]", file=sys.stderr)
 
 
+def cmd_claim(args):
+    """Move msg from inbox→processing/ for exclusive consumption."""
+    root = resolve_root()
+    inbox = root / args.worker / "inbox"
+    processing = root / args.worker / "processing"
+    files = list_messages(inbox)
+
+    target = None
+    for f in files:
+        if f.stem == args.msg_id:
+            target = f
+            break
+
+    if target is None:
+        sys.exit(f"msg not found in inbox: {args.msg_id}")
+
+    processing.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(str(target), str(processing / target.name))
+    except OSError as e:
+        sys.exit(f"claim failed (already claimed?): {e}")
+
+    print(f"claimed → processing/{target.name}")
+
+
+def cmd_release(args):
+    """Move msg from processing/ back to inbox."""
+    root = resolve_root()
+    inbox = root / args.worker / "inbox"
+    processing = root / args.worker / "processing"
+    target = processing / f"{args.msg_id}.json"
+    if not target.exists():
+        sys.exit(f"msg not found in processing/: {args.msg_id}")
+    try:
+        os.replace(str(target), str(inbox / target.name))
+    except OSError as e:
+        sys.exit(f"release failed: {e}")
+    print(f"released → inbox/{target.name}")
+
+
 def cmd_status(args):
+    root = resolve_root()
     if args.state not in VALID_STATES:
         sys.exit(f"invalid state: {args.state}")
     status = {
@@ -93,21 +227,24 @@ def cmd_status(args):
         "last_conclusion": args.last_conclusion or "",
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    dest = ROOT / args.worker / "status.json"
-    tmp = ROOT / args.worker / ".tmp-status.json"
+    worker_dir = root / args.worker
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    dest = worker_dir / "status.json"
+    tmp = worker_dir / ".tmp-status.json"
     tmp.write_text(json.dumps(status, indent=2, ensure_ascii=False))
     os.replace(str(tmp), str(dest))
     print(f"status: {args.state}")
 
 
 def cmd_clear(args):
-    archive = ROOT / args.worker / "archive"
+    root = resolve_root()
+    archive = root / args.worker / "archive"
     count = 0
     if archive.exists():
         for f in archive.glob("*.json"):
             f.unlink(); count += 1
     if args.prune_corrupt:
-        cdir = ROOT / args.worker / "_corrupt"
+        cdir = root / args.worker / "_corrupt"
         if cdir.exists():
             cutoff = datetime.now().timestamp() - args.older_than_days * 86400
             for f in cdir.glob("*.json"):
@@ -117,8 +254,9 @@ def cmd_clear(args):
 
 
 def cmd_stats(args):
-    for d in ["inbox", "archive", "_corrupt"]:
-        p = ROOT / args.worker / d
+    root = resolve_root()
+    for d in ["inbox", "archive", "processing", "_corrupt"]:
+        p = root / args.worker / d
         c = len(list(p.glob("*.json"))) if p.exists() else 0
         print(f"{d}: {c}")
 
@@ -127,39 +265,65 @@ def main():
     p = argparse.ArgumentParser(description="mailbox v2 CLI (standalone)")
     sub = p.add_subparsers(dest="cmd")
 
+    # send
     s = sub.add_parser("send")
     s.add_argument("--from", required=True, dest="from_worker")
     s.add_argument("--to", required=True)
     s.add_argument("--subject", required=True)
     s.add_argument("--body", required=True)
-    s.add_argument("--kind", default="REPORT", choices=VALID_KINDS)
+    s.add_argument("--kind", default="REPORT", choices=sorted(VALID_KINDS))
+    s.add_argument("--reply-to", default="")
 
+    # peek (non-consuming)
+    pk = sub.add_parser("peek")
+    pk.add_argument("--worker", required=True)
+    pk.add_argument("--max-messages", type=int, default=5)
+    pk.add_argument("--max-subject", type=int, default=80)
+
+    # check (consume — validate + archive)
     c = sub.add_parser("check")
     c.add_argument("--worker", required=True)
     c.add_argument("--json", action="store_true")
     c.add_argument("--max-messages", type=int, default=0)
 
+    # claim
+    cl = sub.add_parser("claim")
+    cl.add_argument("--worker", required=True)
+    cl.add_argument("--msg-id", required=True)
+
+    # release
+    rl = sub.add_parser("release")
+    rl.add_argument("--worker", required=True)
+    rl.add_argument("--msg-id", required=True)
+
+    # status
     st = sub.add_parser("status")
     st.add_argument("--worker", required=True)
     st.add_argument("--state", required=True, choices=sorted(VALID_STATES))
     st.add_argument("--current-task", default="")
     st.add_argument("--last-conclusion", default="")
 
-    cl = sub.add_parser("clear")
-    cl.add_argument("--worker", required=True)
-    cl.add_argument("--prune-corrupt", action="store_true")
-    cl.add_argument("--older-than-days", type=int, default=30)
+    # clear
+    clr = sub.add_parser("clear")
+    clr.add_argument("--worker", required=True)
+    clr.add_argument("--prune-corrupt", action="store_true")
+    clr.add_argument("--older-than-days", type=int, default=30)
 
+    # stats
     ss = sub.add_parser("stats")
     ss.add_argument("--worker", required=True)
 
     args = p.parse_args()
     if args.cmd == "send": cmd_send(args)
     elif args.cmd == "check": cmd_check(args)
+    elif args.cmd == "peek": cmd_peek(args)
+    elif args.cmd == "claim": cmd_claim(args)
+    elif args.cmd == "release": cmd_release(args)
     elif args.cmd == "status": cmd_status(args)
     elif args.cmd == "clear": cmd_clear(args)
     elif args.cmd == "stats": cmd_stats(args)
     else: p.print_help()
+
 
 if __name__ == "__main__":
     main()

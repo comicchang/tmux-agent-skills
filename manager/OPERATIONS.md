@@ -10,12 +10,13 @@ v2 mailbox 位于共享仓库：
 
 ```text
 _mailbox/
-  manager/{inbox,archive,_corrupt}/
-  <worker-id>/{inbox,archive,_corrupt}/
+  manager/{inbox,archive,processing,_corrupt}/
+  <worker-id>/{inbox,archive,processing,_corrupt}/
   <worker-id>/status.json
 ```
 
 Syncthing 同步共享根。所有参与者直接写**收件人** inbox；没有 outbox、relay daemon、cursor 或已读 ACK 文件。`~/.drafts/tmux-workers/<id>/ipc` 与事件文件仅保留给启动诊断和 v1 兼容。
+`processing/` 提供竞态保护：Worker 通过 `mailbox claim` 独占消息 → `processing/`，处理后 `mailbox check` 验证并归档；`mailbox release` 放回 inbox。Manager 监控 `processing/` 计数诊断卡住任务。
 
 ```bash
 scripts/tmux_worker.py validate --config workers.toml
