@@ -15,13 +15,13 @@ description: tmux-agent-manager v3 — 薄编排契约
 
 | Direction | Primary path | Purpose |
 |---|---|---|
-| Manager→Worker | v2 mailbox direct inbox | 正式 TASK、补充材料、需留痕的指令 |
-| Manager→Worker | `tmux send-keys` | 只发本地 Worker 的 `MAILBOX_PENDING` 或短 steering；不承载正式任务正文 |
-| Worker→Manager | v2 mailbox direct inbox | `REPORT`、`PROGRESS`、`QUESTION`、`NOTICE` |
-| Worker→Worker | v2 mailbox direct inbox | peer 问答、证据与复核请求；Syncthing 直接同步 |
+| Manager→Worker | standalone `mailbox` direct inbox | 正式 INIT/TASK、补充材料、需留痕的指令 |
+| Manager→Worker | `tmux send-keys` | INIT 后的检查 inbox 提示或短 steering；不承载正式任务正文 |
+| Worker→Manager | standalone `mailbox` direct inbox | `REPORT`、`PROGRESS`、`QUESTION`、`NOTICE` |
+| Worker→Worker | standalone `mailbox` direct inbox | peer 问答、证据与复核请求；Syncthing 直接同步 |
 | Worker→all observers | `_mailbox/<session>/<agent>/status.json` | `IDLE/BUSY/DONE/BLOCKED`、当前任务、最后结论 |
 
-通知策略按部署位置区分：本地 Worker（ios-re、ios-shader、ohos-bin）可收到 `send-keys` 作为辅助唤醒，但 mailbox 才是可靠 payload；远程 SSH Worker（aosp、hyperos、ohos）无法可靠接收 Manager 的 send-keys，若没有 runner adapter，必须在 task start/end、阶段边界和长工具返回后主动轮询自己的 inbox。启用 framework-neutral adapter 时由 standalone CLI 完成 watch/peek→inject/status_update。Manager 对所有 Worker 都轮询 `status.json` 与 inbox 计数；send-keys 成功不代表远程送达。
+通知策略按部署位置区分：mailbox 才是可靠 payload，send-keys 只用于唤醒或提示。INIT 是例外的显式握手：Manager 必须先写正式 INIT，再向目标 pane 发送“检查 inbox”的提示；远程 SSH Worker 没有本地 tmux socket 时，使用其可用的 runner/交互通道发送同一提示。无论提示是否送达，Manager 都必须等待 Worker 主动 `mailbox read` 并验证五字段 `status.json`，不能把 send-keys 成功当作送达或状态证据。后续远程 Worker 若无 runner adapter，仍须在 task start/end、阶段边界和长工具返回后主动轮询自己的 inbox。启用 framework-neutral adapter 时由 standalone CLI 完成 watch/peek→inject/status_update。Manager 对所有 Worker 都轮询 `status.json` 与 inbox 计数。
 
 ## v2 Direct Inbox
 
@@ -43,41 +43,58 @@ _mailbox/<session_id>/
     status.json   # Agent 自报状态
 ```
 
+以下命令与 INIT 模板中的 `<session-id>`、`<agent-id>`、`<worker-id>`、`<role>` 和 `<artifact-root>` 都是说明性占位符；Manager 发送前必须以 session 初始化结果、workers.toml 和实际 Worker 启动信息替换它们，不能把尖括号原样发送。
+
 ```bash
-# 先用 workers.toml 真源确认收件人；禁止猜 ID
-scripts/tmux_worker.py mailbox-roster --config workers.toml
+# 创建 session；agents 使用 workers.toml 中的准确 ID，逗号分隔
+mailbox session-init --session <session-id> --manager manager --agents <agent-id>,<another-agent-id>
 
-# Manager 正式派 TASK；正文必须完整、可独立执行
-scripts/tmux_worker.py mailbox send \
-  --session <session-id> --from manager --to <agent-id> --kind TASK \
-  --subject "<short task>" --body "<full task and acceptance criteria>"
+# Manager 正式派 INIT/TASK；正文必须完整、可独立执行
+mailbox send \
+  --session <session-id> --from manager --to <worker-id> --kind TASK \
+  --subject "INIT" \
+  --body "INIT. Exact session_id=<session-id>; exact worker_id=<worker-id>; role_profile=<role>; artifact_root=<artifact-root>. After reading this message, write IDLE status with mailbox status. If restored with omp -c, discard ALL prior mailbox paths, command names, protocol assumptions, and IPC mechanisms; re-read skill://tmux-agent-worker and skill://tmux-agent-manager for the CURRENT protocol. Use only standalone mailbox, session_id, read→finalize, and status.json."
+```
 
-# send-keys 仅唤醒本地 Worker；远程 Worker 完全依赖主动轮询
-tmux send-keys -t <target> -l -- "MAILBOX_PENDING; check v2 inbox"
-tmux send-keys -t <target> C-m
+### INIT 握手（每个 Worker 必须完成）
+
+1. **写入正式 INIT（a）**：Manager 用上面的 `mailbox send` 将 `kind=TASK`、`subject=INIT` 写入目标 Worker inbox；body 必须包含该 Worker 的实际 `session_id`、`worker_id`、role profile、artifact root 和兼容握手要求。
+2. **发送检查提示（b）**：紧接着向目标 pane 发同一身份信息的短提示，明确要求立即检查 inbox。目标支持 tmux 时使用：
+
+   ```bash
+   tmux send-keys -t <target> -l -- "Check your mailbox now. Exact session_id is <session-id>; exact worker_id is <worker-id>. If this session was restored with omp -c, discard ALL prior mailbox/relay/outbox/IPC logic and re-read skill://tmux-agent-worker and skill://tmux-agent-manager; use only the CURRENT standalone mailbox protocol and session-based paths. Run mailbox read --session <session-id> --agent <worker-id> --owner <worker-id> --json, then write IDLE with mailbox status."
+   tmux send-keys -t <target> C-m
+   ```
+
+   `<session-id>` 与 `<worker-id>` 在发送前必须替换为实际值；send-keys 只是唤醒/提示，不承载正式 INIT 正文。远程 SSH Worker 没有本地 tmux socket 时，通过其可用 runner/交互通道发送完全相同的提示；若没有该通道，仍以共享 inbox 为 payload，并要求 Worker 主动轮询。
+3. **Worker 读取并确认（c）**：Worker 执行 `mailbox read`（inbox→processing），校验 INIT 的实际身份，随后执行 `mailbox status --session <session-id> --agent <worker-id> --state IDLE --current-task "waiting for TASK" --last-conclusion "INIT accepted"`，再以读到的消息 ID 执行 `mailbox finalize`（processing→archive）；Manager 不得以 pane 文本或 send-keys 回显代替这个状态写入。
+4. **验证握手（d）**：Manager 检查 `_mailbox/<session-id>/<worker-id>/status.json` 已存在、`session_id` 等于实际 session ID，并含五个字段 `session_id`、`state`、`current_task`、`last_conclusion`、`updated_at`；验证通过后才能派正式 TASK。Worker 若没有后台 polling，也必须由上述提示触发这次主动 `mailbox read`。
+
+```bash
 
 # Manager 读取自己的 inbox：read (inbox→processing, auto-claim) → 处理 → finalize (processing→archive)
-scripts/tmux_worker.py mailbox read \
+mailbox read \
   --session <session-id> --agent manager --owner manager [--json]
-scripts/tmux_worker.py mailbox finalize \
+mailbox finalize \
   --session <session-id> --agent manager --msg-id <id> --owner manager
 
 # 非消费查看、统计与清理
-scripts/tmux_worker.py mailbox peek --session <session-id> --agent manager [--json]
-scripts/tmux_worker.py mailbox stats --session <session-id> --agent manager  # shows all4 dirs: inbox/processing/archive/_corrupt
-scripts/tmux_worker.py mailbox clear --session <session-id> --agent manager
+mailbox peek --session <session-id> --agent manager [--json]
+mailbox stats --session <session-id> --agent manager  # shows all 4 dirs: inbox/processing/archive/_corrupt
+mailbox clear --session <session-id> --agent manager
 
 # 崩溃恢复：将过期 processing 消息放回 inbox
-scripts/tmux_worker.py mailbox recover-stale --session <session-id> --agent manager
+mailbox recover-stale --session <session-id> --agent manager
 ```
 
-远程 SSH Worker 的可靠通知路径只有共享 inbox + Worker 主动轮询；不要假设 Manager 能把 send-keys 注入远程 agent。
+远程 SSH Worker 的可靠通知路径是共享 inbox + Worker 主动轮询；send-keys 提示不构成送达证据。
 
 ## Plugin and runner integration (preferred, framework-neutral)
 
-The mailbox behavior is implemented by standalone CLI functions (`mailbox send`, `mailbox read`, `mailbox finalize`, `mailbox peek`, `mailbox stats`, `mailbox status`, `mailbox clear`, `mailbox recover-stale`). A tmux/oh-my-pi plugin, opencode adapter, or another runner MAY invoke `mailbox peek` at safe boundaries for notification; the **plugin only notifies — never consumes**. The agent reads via `mailbox read`. No skill depends on private runner hooks.
+The authoritative standalone CLI command set is `session-init`, `send`, `peek`, `read`, `finalize`, `release`, `recover-stale`, `check`, `status`, `clear`, and `stats`; invoke these names directly, never through a runner wrapper. A tmux/oh-my-pi plugin, opencode adapter, or another runner MAY invoke `mailbox peek` at safe boundaries for notification; the **plugin only notifies — never consumes**. The agent reads via `mailbox read`. No skill depends on private runner hooks.
+The standalone executable is available at `~/src/tmux-agent-skills/tools/mailbox` or `~/.omp/plugins/node_modules/omp-mailbox-plugin/bin/mailbox`; either path works. Do not route commands through `scripts/tmux_worker.py`.
 
-Manager still polls each `status.json` and inbox statistics for observability. Adapter injection is not a substitute for final REPORT or artifact verification. If no adapter is available, the runner calls the standalone CLI at the documented boundaries. Remote SSH Workers use the plugin/direct Syncthing path only; Manager send-keys remains local-only.
+Manager still polls each `status.json` and inbox statistics for observability. Adapter injection is not a substitute for final REPORT or artifact verification. If no adapter is available, the runner calls the standalone CLI at the documented boundaries. Remote SSH Worker formal communication uses the plugin/direct Syncthing path; an available runner may carry the INIT check prompt, but send-keys is never the payload or proof of delivery.
 
 v2 消息固定 8 个必填字段：`session_id`、`from`、`to`、`subject`、`body`、`kind`、`msg_id`、`created_at`。3 个可选关联字段：`reply_to`、`run_id`、`request_id`。7 种 kind：`TASK`、`REPORT`、`PROGRESS`、`EVIDENCE`、`QUESTION`、`RESPONSE`、`NOTICE`。文件名与 `msg_id` 一致；消息不可原地修改，纠正内容必须发新消息并用 `--reply-to <msg_id>` 回链。
 
@@ -85,10 +102,11 @@ v2 消息固定 8 个必填字段：`session_id`、`from`、`to`、`subject`、`
 
 ## 3. status.json 状态快照
 
-每个 Agent 只写自己的 `_mailbox/<session>/<agent>/status.json`，且文件最多四个字段：
+每个 Agent 只写自己的 `_mailbox/<session>/<agent>/status.json`，且文件固定为五个字段：`session_id`、`state`、`current_task`、`last_conclusion`、`updated_at`。
 
 ```json
 {
+  "session_id": "<session-id>",
   "state": "BUSY",
   "current_task": "verify shadow paths",
   "last_conclusion": "traditional and SDF paths are separate",
@@ -96,17 +114,19 @@ v2 消息固定 8 个必填字段：`session_id`、`from`、`to`、`subject`、`
 }
 ```
 
+- `session_id`: 当前 session 的实际 ID，必须与目录名一致，由 `mailbox status` 自动写入。
 - `state`: `IDLE | BUSY | DONE | BLOCKED`。
 - `current_task`: 一句话任务摘要；不得塞任务全文。
 - `last_conclusion`: 一句话最新结论或阻断原因。
 - `updated_at`: UTC，仅用于新鲜度诊断，不用于跨机器消息排序。
 
+
 Manager 派发前必须读取目标 status：只有 `IDLE/DONE/BLOCKED` 且已处理上一条 REPORT 才可派新任务。`BUSY` 禁止并发派发。状态过旧时先检查 inbox、Syncthing 与 Worker 可达性，不能凭旧值宣告空闲。
 
 ## 4. 派发、轮询与收件
 
-1. 用 `mailbox-roster` 验证收件人并读其 `status.json`。
-2. 用 `mailbox send --session <id> --kind TASK` 直写目标 inbox。仅对本地 Worker 可额外发短 `send-keys` 唤醒；远程 Worker 不依赖该提示。
+1. INIT 握手完成后，用 workers.toml 与 `_mailbox/<session>/session.json` 中的准确 ID 验证收件人和目标 status；不要猜 ID。
+2. 用 `mailbox send --session <session-id> --from manager --to <worker-id> --kind TASK` 直写目标 inbox。正式 TASK 之前必须完成上面的 INIT 四步握手；后续仅可对支持交互通道的 Worker 发短 `send-keys` 提示，远程 Worker 不依赖该提示。
 3. 每 5 秒轮询目标 `status.json` 和 `mailbox stats` 的 inbox 数量；值由 `BUSY` 转为 `DONE/BLOCKED` 后，轮询 Manager inbox 收取对应 `REPORT`。
 4. Worker 无论本地还是远程都在 task start/end、阶段边界和长工具返回后主动 `mailbox read`。Manager 自己在派发前、等待期间每个检查周期、处理完一封消息后再次 `mailbox read` Manager inbox，直到为空。
 5. 读完 artifact/REPORT、安排后续后，再 `mailbox finalize` 归档，最后 `mailbox clear`；不得在消息尚未处理时 clear。
@@ -123,8 +143,8 @@ Manager 派发前必须读取目标 status：只有 `IDLE/DONE/BLOCKED` 且已�
 - **Syncthing conflict**：任何 `.sync-conflict-*` 文件都不是有效消息。保留原件，比较双方内容，由发送方通过 CLI 发一封新消息；不得 rename 成正常消息伪造投递。
 - **Clock skew**：处理顺序以 inbox 文件 mtime/实际可见顺序为准，`created_at` 和文件名时间只做诊断。明显偏差时记录 `CLOCK_SKEW`，不要重写时间戳。
 - **Stale status / pending inbox**：`updated_at` 超过预期 SLA 时状态为 `STALE` 诊断，不等同 `IDLE` 或 `BLOCKED`。Manager 先检查 inbox count、Syncthing 和 pane liveness；本地可再发 wake，远程只能等待 Worker 的下一次主动 poll。
-- **Missing recipient**：发送失败即重新运行 `mailbox-roster`/检查 `_mailbox/<session>/<agent>/inbox`，不创建拼错的目录。
-- **Crash recovery**：发现 `processing/` 中有过期消息（超过 300s lease），运行 `mailbox recover-stale --session <id> --agent <id>` 自动放回 inbox；不手移文件。
+- **Missing recipient**：发送失败即重新核对 workers.toml、`session.json` 与 `_mailbox/<session>/<agent>/inbox`，不创建拼错的目录。
+- **Crash recovery**：发现 `processing/` 中有过期消息（超过 300s lease），运行 `mailbox recover-stale --session <session-id> --agent <agent-id>` 自动放回 inbox；不手移文件。
 
 ## 7. 预防规则
 
@@ -137,6 +157,10 @@ Manager 派发前必须读取目标 status：只有 `IDLE/DONE/BLOCKED` 且已�
 - 远程 Worker 的可见性以 status/inbox 轮询为准；send-keys 成功返回不代表消息已被 agent 看到。
 
 ## 8. 启动与故障边界
+
+### Launch and Identity
+
+For a restored session (`omp -c`), the first action after INIT is to discard ALL prior mailbox paths, command names, protocol assumptions, and IPC mechanisms; re-read `skill://tmux-agent-worker` and `skill://tmux-agent-manager` for the CURRENT protocol. The ONLY valid commands are the standalone `mailbox` CLI, and the ONLY valid paths are `_mailbox/<session>/<agent>/inbox|processing|archive/`. Do not reference `scripts/tmux_worker.py`, `workers.toml`, `mailbox-v2-*`, outbox, relay, cursor, or flat `_mailbox/<worker>/` paths.
 
 Marker 与 pane liveness 仍用于启动：`PANE_ALIVE → SHELL_READY → CWD_VERIFIED → AGENT_STARTED`。启动完成后 Worker 通过 status 写 `IDLE`。Manager 失联、同步失败或工具不可用时，Worker 保存产物、发送 `REPORT/NOTICE`，并将 status 更新为 `BLOCKED`；禁止硬 kill。
 
