@@ -54,8 +54,9 @@ mailbox stats         --session <id> --agent <id>
 
 ## Installation
 
-    git clone https://github.com/comicchang/tmux-agent-skills.git
-    export PATH="$PATH:$(pwd)/tmux-agent-skills/tools"
+    git clone https://github.com/comicchang/tmux-agent-skills.git ~/src/tmux-agent-skills
+    ln -sf ~/src/tmux-agent-skills/tools/mailbox ~/.claude/bin/mailbox
+    ln -sf ~/src/tmux-agent-skills/tools/mailbox-hook ~/.claude/bin/mailbox-hook
 
 ## Notification Strategy
 
