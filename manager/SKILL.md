@@ -81,7 +81,7 @@ mailbox session-init --session <session-id> --manager manager --agents <agent-id
 mailbox send \
   --session <session-id> --from manager --to <worker-id> --kind TASK \
   --subject "INIT" \
-  --body "INIT. Exact session_id=<session-id>; exact worker_id=<worker-id>; role_profile=<role>; artifact_root=<artifact-root>. Write ~/.omp/mailbox-identity.json with these exact IDs, then read this INIT, write IDLE status, and finalize it. If restored with omp -c, discard ALL prior mailbox paths, command names, protocol assumptions, and IPC mechanisms; re-read skill://tmux-agent-worker and skill://tmux-agent-manager for the CURRENT protocol. Use only standalone mailbox, session_id, read→finalize, status.json, and the identity file."
+  --body "INIT. Exact session_id=<session-id>; exact worker_id=<worker-id>; role_profile=<role>; artifact_root=<artifact-root>. Write {\"session_id\":\"<session-id>\",\"worker_id\":\"<worker-id>\"} to the per-process identity path exposed as OMP_MAILBOX_IDENTITY_FILE, then read this INIT, write IDLE status, and finalize it. If restored with omp -c, discard ALL prior mailbox paths, command names, protocol assumptions, and IPC mechanisms; re-read skill://tmux-agent-worker and skill://tmux-agent-manager for the CURRENT protocol. Use only standalone mailbox, session_id, read→finalize, status.json, and the per-process identity file."
 ```
 
 ### INIT 握手（每个 Worker 必须完成）
@@ -97,7 +97,7 @@ mailbox send \
 2. **发送检查提示（b）**：紧接着向目标 pane 发同一身份信息的短提示，明确要求立即检查 inbox。目标支持 tmux 时使用：
 
    ```bash
-   tmux send-keys -t <target> -l -- "Registration: write identity file ~/.omp/mailbox-identity.json with exact session_id=<session-id> and worker_id=<worker-id>, then check inbox with mailbox read --session <session-id> --agent <worker-id> --owner <worker-id> --json. If restored with omp -c, first discard ALL prior mailbox/relay/outbox/IPC logic and re-read skill://tmux-agent-worker and skill://tmux-agent-manager; use only the CURRENT standalone mailbox protocol and session-based paths."
+   tmux send-keys -t <target> -l -- "Registration: write {session_id, worker_id} with exact session_id=<session-id> and worker_id=<worker-id> to the per-process \$OMP_MAILBOX_IDENTITY_FILE path, then check inbox with mailbox read --session <session-id> --agent <worker-id> --owner <worker-id> --json. If restored with omp -c, first discard ALL prior mailbox/relay/outbox/IPC logic and re-read skill://tmux-agent-worker and skill://tmux-agent-manager; use only the CURRENT standalone mailbox protocol and session-based paths."
    tmux send-keys -t <target> C-m
    ```
 

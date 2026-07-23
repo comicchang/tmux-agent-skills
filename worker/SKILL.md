@@ -36,17 +36,17 @@ Manager 仍负责 shell、cwd 与 agent 启动。INIT 必须明确提供实际�
 
 ## INIT Handshake
 
-Manager 先通过 standalone `mailbox send` 写入 `kind=TASK`、`subject=INIT` 的正式 INIT，再用 send-keys（或远程 runner 可用的等价交互提示）发送“Registration: write identity file and check inbox”；提示不是任务正文。收到提示后立即执行 `mailbox read --session <session-id> --agent <worker-id> --owner <worker-id> --json`，验证 INIT 中的实际身份与 role profile，写入身份注册文件，执行 `mailbox status --session <session-id> --agent <worker-id> --state IDLE --current-task "waiting for TASK" --last-conclusion "INIT accepted"`，然后用该消息的 `<id>` 执行 `mailbox finalize --session <session-id> --agent <worker-id> --msg-id <id> --owner <worker-id>`。Manager 会检查 `.mailbox/<session-id>/<worker-id>/status.json` 已存在且含五个字段后，才认为握手完成；不要用终端回显或 send-keys 代替 status。
+Manager 先通过 standalone `mailbox send` 写入 `kind=TASK`、`subject=INIT` 的正式 INIT，再用 send-keys（或远程 runner 可用的等价交互提示）发送“Registration: write identity file and check inbox”；提示不是任务正文。收到提示后立即执行 `mailbox read --session <session-id> --agent <worker-id> --owner <worker-id> --json`，验证 INIT 中的实际身份与 role profile，向 `$OMP_MAILBOX_IDENTITY_FILE` 写入身份注册 JSON，执行 `mailbox status --session <session-id> --agent <worker-id> --state IDLE --current-task "waiting for TASK" --last-conclusion "INIT accepted"`，然后用该消息的 `<id>` 执行 `mailbox finalize --session <session-id> --agent <worker-id> --msg-id <id> --owner <worker-id>`。Manager 会检查 `.mailbox/<session-id>/<worker-id>/status.json` 已存在且含五个字段后，才认为握手完成；不要用终端回显或 send-keys 代替 status。
 
 ### Plugin activation after INIT
 
-After reading INIT identity, the Worker MUST register its actual session and worker IDs for the omp-mailbox-plugin by writing this file:
+At OMP process startup, the plugin generates a unique per-process identity path such as `pid-random.json` and sets `$OMP_MAILBOX_IDENTITY_FILE` to that path. Each Worker MUST write its exact session and worker IDs to that path during INIT:
 
 ```bash
-echo '{"session_id":"<session-id>","worker_id":"<worker-id>"}' > ~/.omp/mailbox-identity.json
+echo '{"session_id":"<session-id>","worker_id":"<worker-id>"}' > "$OMP_MAILBOX_IDENTITY_FILE"
 ```
 
-The plugin checks `~/.omp/mailbox-identity.json` through `getConfigFromFile()` on every `agent_end` and auto-activates on the next `agent_end`; no OMP restart is needed. The file may use either `session_id`/`worker_id` or the plugin-supported camelCase keys `sessionId`/`workerId`. Do not use the old OMP environment-variable/restart approach as the registration mechanism. After writing the file, set status `IDLE`, then run the Mailbox health gate; future notifications are not assumed active until the next `agent_end`.
+The plugin polls this file every 2 seconds and activates mailbox monitoring as soon as the JSON appears; no `agent_end` dependency or OMP restart is needed. If `$OMP_MAILBOX_IDENTITY_FILE` is unset or the write fails, report `MAILBOX_HEALTH_FAILED` to Manager and do not proceed. On `session_shutdown`, the plugin deletes the identity file. The per-process nonce path prevents multiple agents on the same machine from conflicting.
 
 ### Mailbox health gate
 
@@ -57,7 +57,7 @@ After consuming INIT and writing `IDLE`, the Worker MUST run this as the FIRST a
 # status read/write, and OMP plugin identity registration (all 8 connectivity checks)
 mailbox-health --session <session-id> --agent <worker-id> --json
 ```
-Inspect the JSON result; every check must pass before TASK work or notification polling begins. If any check fails, use its diagnostic to report the exact broken condition (missing directory, unavailable CLI, unwritable status, missing plugin identity file, etc.) and wait for repair. If `mailbox-health` itself is not found or produces no output, do NOT proceed; send the Manager a `NOTICE` describing the health-command failure, then wait:
+Inspect the JSON result; every check must pass before TASK work or notification polling begins. If any check fails, use its diagnostic to report the exact broken condition (missing directory, unavailable CLI, unwritable status, unset `$OMP_MAILBOX_IDENTITY_FILE`, etc.) and wait for repair. If `mailbox-health` itself is not found or produces no output, do NOT proceed; send the Manager a `NOTICE` describing the health-command failure, then wait:
 
 ```bash
 mailbox send --session <session-id> --from <worker-id> --to manager \
