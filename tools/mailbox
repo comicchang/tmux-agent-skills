@@ -294,8 +294,8 @@ def cmd_read(args):
             "claimed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "msg_id": target.stem,
         }
-        claim_file = processing / f".claim-{target.stem}.json"
-        tmp_claim = processing / f".tmp-claim-{target.stem}.json"
+        claim_file = processing / f".claim-{target.stem}-{args.owner}.json"
+        tmp_claim = processing / f".tmp-claim-{target.stem}-{args.owner}.json"
         with open(tmp_claim, "w") as fc:
             fc.write(json.dumps(claim_meta))
             fc.flush()
@@ -328,16 +328,18 @@ def cmd_finalize(args):
     root = resolve_root()
     processing = agent_subdir(root, args.session, args.agent, "processing")
     archive = agent_subdir(root, args.session, args.agent, "archive")
-
     target = processing / f"{args.msg_id}.json"
-    claim_file = processing / f".claim-{args.msg_id}.json"
+
+    # Scan for claim file matching this msg_id (supports per-owner naming: .claim-{msg_id}-{owner}.json)
+    claim_files = sorted(processing.glob(f".claim-{args.msg_id}-*.json"))
+    if not claim_files:
+        sys.exit(f"no claim file for {args.msg_id} — refusing to finalize")
+    if len(claim_files) > 1:
+        sys.exit(f"multiple claim files for {args.msg_id} — refusing to finalize")
+    claim_file = claim_files[0]
 
     if not target.exists():
         sys.exit(f"msg not in processing/: {args.msg_id}")
-
-    # P0 Fix 2: fail closed — claim file must exist
-    if not claim_file.exists():
-        sys.exit(f"no claim file for {args.msg_id} — refusing to finalize")
 
     # Verify ownership via claim file
     try:
@@ -367,13 +369,20 @@ def cmd_release(args):
     inbox = agent_subdir(root, args.session, args.agent, "inbox")
     processing = agent_subdir(root, args.session, args.agent, "processing")
     target = processing / f"{args.msg_id}.json"
-    claim_file = processing / f".claim-{args.msg_id}.json"
+
+    # Scan for claim file matching this msg_id (supports per-owner naming: .claim-{msg_id}-{owner}.json)
+    claim_files = sorted(processing.glob(f".claim-{args.msg_id}-*.json"))
 
     if not target.exists():
         sys.exit(f"msg not found in processing/: {args.msg_id}")
 
+    if len(claim_files) > 1:
+        sys.exit(f"multiple claim files for {args.msg_id} — refusing to release")
+
+    claim_file = claim_files[0] if claim_files else None
+
     # P0 Fix 3: verify claim file owner
-    if claim_file.exists():
+    if claim_file and claim_file.exists():
         try:
             claim = json.loads(claim_file.read_bytes())
             if claim.get("owner") != args.owner:
@@ -389,7 +398,8 @@ def cmd_release(args):
     except OSError as e:
         sys.exit(f"release failed: {e}")
 
-    claim_file.unlink(missing_ok=True)
+    if claim_file:
+        claim_file.unlink(missing_ok=True)
     print(f"released → inbox/{target.name}")
 
 
@@ -412,7 +422,7 @@ def cmd_recover_stale(args):
             if claimed_at_s:
                 claimed_ts = datetime.fromisoformat(claimed_at_s).timestamp()
                 if claimed_ts < cutoff:
-                    msg_id = claim.get("msg_id", cf.stem.replace(".claim-", ""))
+                    msg_id = claim.get("msg_id") or cf.stem.replace(".claim-", "", 1).split("-", 1)[0]
                     msg_file = processing_dir / f"{msg_id}.json"
                     if msg_file.exists():
                         os.replace(str(msg_file), str(inbox / msg_file.name))
