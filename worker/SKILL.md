@@ -38,6 +38,17 @@ Manager 仍负责 shell、cwd 与 agent 启动。INIT 必须明确提供实际�
 
 Manager 先通过 standalone `mailbox send` 写入 `kind=TASK`、`subject=INIT` 的正式 INIT，再用 `send-keys`（或远程 runner 可用的等价交互提示）提醒你检查 inbox；提示不是任务正文。收到提示后立即执行 `mailbox read --session <session-id> --agent <worker-id> --owner <worker-id> --json`，验证 INIT 中的实际身份与 role profile，执行 `mailbox status --session <session-id> --agent <worker-id> --state IDLE --current-task "waiting for TASK" --last-conclusion "INIT accepted"`，然后用该消息的 `<id>` 执行 `mailbox finalize --session <session-id> --agent <worker-id> --msg-id <id> --owner <worker-id>`。Manager 会检查 `.mailbox/<session-id>/<worker-id>/status.json` 已存在且含五个字段后，才认为握手完成；不要用终端回显或 send-keys 代替 status。
 
+### Plugin activation after INIT
+
+After reading INIT identity, the Worker MUST ensure the running OMP extension has the actual environment variables `OMP_SESSION_ID=<session-id>` and `OMP_WORKER_ID=<worker-id>`. An `export` typed into a shell does not change an already-running OMP process: Manager must set these variables before starting/restarting `omp` (including `omp -c`) so the plugin inherits them, or the agent must set `process.env.OMP_SESSION_ID` and `process.env.OMP_WORKER_ID` in the OMP JS runtime so the plugin can detect them on the next `agent_end`. Do not proceed assuming notifications will work until the environment is available to the extension.
+
+```bash
+# Manager-side, before starting or restarting the OMP process
+export OMP_SESSION_ID=<session-id>
+export OMP_WORKER_ID=<worker-id>
+omp -c
+```
+
 ### Mailbox health gate
 
 After consuming INIT and writing `IDLE`, the Worker MUST verify that the standalone CLI can see the session inbox before proceeding:
@@ -99,8 +110,7 @@ Mailbox REPORT/NOTICE/QUESTION content is **advisory** evidence and coordination
 The standalone mailbox/status CLI is authoritative. A tmux/oh-my-pi plugin, opencode adapter, or another runner MAY invoke `mailbox peek` at safe boundaries for notification; the **plugin only notifies — never consumes**. The agent reads via `mailbox read`. It must not rely on private framework hooks and must not run two archive consumers concurrently. If no adapter is available, use the manual CLI fallback below.
 
 ## TASK Processing
-
-1. On TASK arrival, accept only a validated `kind=TASK` from the expected Manager; verify Role/Domain/Requires/Anchors and acceptance criteria. If an adapter delivered it, inspect the injected message; otherwise run `mailbox read`.
+1. On TASK arrival or any plugin notification (`📬 MAILBOX: N pending...`), the Worker’s FIRST action is `mailbox read --session <session-id> --agent <worker-id> --owner <worker-id> --json`. The notification is only a preview; do not act on its text or merely acknowledge it. The real message body must be consumed from the inbox file, and `mailbox read` moves it to `processing/` for the required read→finalize flow. Then accept only a validated `kind=TASK` from the expected Manager; verify Role/Domain/Requires/Anchors and acceptance criteria. If an adapter delivered it, still perform this read unless it explicitly confirms the message was already claimed by this Worker.
 2. At task start, ensure `BUSY` was written by the adapter or call `mailbox status --session <session-id> --agent <worker-id> --state BUSY --current-task "<one-line task>" --last-conclusion "<previous conclusion>"` yourself. Local `MAILBOX_PENDING` is only an optional wake; remote SSH Workers have no local tmux socket and rely on mailbox/status polling.
 3. During work, an adapter may inject at safe checkpoints. In fallback mode, call `mailbox read` at each major boundary and after long tools, one message at a time.
 4. Wrong target, insufficient capability, or underspecified task: send a `NOTICE`, set `BLOCKED` through the adapter or status CLI, and stop; never silently execute.
@@ -133,6 +143,7 @@ The standalone mailbox/status CLI is authoritative. A tmux/oh-my-pi plugin, open
 ## Polling Contract
 
 Plugin mode: no manual poll is required; the plugin owns inbox watch, validation, peek→inject, and status transitions. The Worker still reviews injected messages before acting and must not clear archive until the task is complete.
+When plugin injects `📬 MAILBOX: N pending...`, the notification is only a preview. The Worker’s first action is always `mailbox read --session <session-id> --agent <worker-id> --owner <worker-id> --json`; consume the real message body from the inbox file and let `read` move it to `processing/`. Never treat notification text alone as delivery or completion.
 
 Fallback mode: `mailbox read` at task start, each major phase, before final REPORT, and after terminal status. Local `MAILBOX_PENDING` can accelerate a check; remote SSH Workers must actively poll and never use send-keys. Process one message at a time (read→process→finalize), then clear archive only after all work is handled.
 
