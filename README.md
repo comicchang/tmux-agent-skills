@@ -18,6 +18,8 @@ $MAILBOX_ROOT/
     <agent>/inbox|processing|archive/status.json
 ```
 
+`.drafts/` is for agent work artifacts; `.mailbox/` is for agent-to-agent communication.
+
 ## Contents
 
 | Path | Purpose |

@@ -28,15 +28,15 @@ Manager 仍负责 shell、cwd 与 agent 启动。INIT 必须明确提供实际�
 
 ### Restored session (`omp -c`)
 
-恢复的 session 可能带有 session-based protocol 之前的 stale IPC/conversation context。**RESET 必须先于正式 INIT TASK**：收到 Manager 的 reset/wake prompt 后，第一个动作必须是丢弃所有此前的 mailbox paths、command names、protocol assumptions 和 IPC mechanisms；重新读取 `skill://tmux-agent-worker` 与 `skill://tmux-agent-manager` 的 CURRENT protocol。唯一有效的命令是 standalone `mailbox` CLI；唯一有效的路径是 `_mailbox/<session>/<agent>/inbox|processing|archive/`。不得引用 `scripts/tmux_worker.py`、`workers.toml`、`mailbox-v2-*`、outbox、relay、cursor 或 flat `_mailbox/<worker>/` 路径。用 `ls _mailbox/<session-id>/<worker-id>/inbox/` 验证实际 inbox，再执行正式 INIT Handshake；不要因旧上下文报告 “Inbox empty” 而改查 flat path。
+恢复的 session 可能带有 session-based protocol 之前的 stale IPC/conversation context。**RESET 必须先于正式 INIT TASK**：收到 Manager 的 reset/wake prompt 后，第一个动作必须是丢弃所有此前的 mailbox paths、command names、protocol assumptions 和 IPC mechanisms；重新读取 `skill://tmux-agent-worker` 与 `skill://tmux-agent-manager` 的 CURRENT protocol。唯一有效的命令是 standalone `mailbox` CLI；唯一有效的路径是 `.mailbox/<session>/<agent>/inbox|processing|archive/`。不得引用 `scripts/tmux_worker.py`、`workers.toml`、`mailbox-v2-*`、outbox、relay、cursor 或 flat `.mailbox/<worker>/` 路径。用 `ls .mailbox/<session-id>/<worker-id>/inbox/` 验证实际 inbox，再执行正式 INIT Handshake；不要因旧上下文报告 “Inbox empty” 而改查 flat path。
 
 ### Already initialized
 
-若 `_mailbox/<session-id>/<worker-id>/status.json` 已存在且 `state` 为 `IDLE`，说明 INIT 已完成。此时新的 INIT 是 **NO-OP**：不要重新读取 skills、不要重写 IDLE、不要再次发送或消费 INIT；只执行 `mailbox peek --session <session-id> --agent <worker-id> [--json]`，然后按正常 polling contract 用 `mailbox read` 处理新的 TASK。
+若 `.mailbox/<session-id>/<worker-id>/status.json` 已存在且 `state` 为 `IDLE`，说明 INIT 已完成。此时新的 INIT 是 **NO-OP**：不要重新读取 skills、不要重写 IDLE、不要再次发送或消费 INIT；只执行 `mailbox peek --session <session-id> --agent <worker-id> [--json]`，然后按正常 polling contract 用 `mailbox read` 处理新的 TASK。
 
 ## INIT Handshake
 
-Manager 先通过 standalone `mailbox send` 写入 `kind=TASK`、`subject=INIT` 的正式 INIT，再用 `send-keys`（或远程 runner 可用的等价交互提示）提醒你检查 inbox；提示不是任务正文。收到提示后立即执行 `mailbox read --session <session-id> --agent <worker-id> --owner <worker-id> --json`，验证 INIT 中的实际身份与 role profile，执行 `mailbox status --session <session-id> --agent <worker-id> --state IDLE --current-task "waiting for TASK" --last-conclusion "INIT accepted"`，然后用该消息的 `<id>` 执行 `mailbox finalize --session <session-id> --agent <worker-id> --msg-id <id> --owner <worker-id>`。Manager 会检查 `_mailbox/<session-id>/<worker-id>/status.json` 已存在且含五个字段后，才认为握手完成；不要用终端回显或 send-keys 代替 status。
+Manager 先通过 standalone `mailbox send` 写入 `kind=TASK`、`subject=INIT` 的正式 INIT，再用 `send-keys`（或远程 runner 可用的等价交互提示）提醒你检查 inbox；提示不是任务正文。收到提示后立即执行 `mailbox read --session <session-id> --agent <worker-id> --owner <worker-id> --json`，验证 INIT 中的实际身份与 role profile，执行 `mailbox status --session <session-id> --agent <worker-id> --state IDLE --current-task "waiting for TASK" --last-conclusion "INIT accepted"`，然后用该消息的 `<id>` 执行 `mailbox finalize --session <session-id> --agent <worker-id> --msg-id <id> --owner <worker-id>`。Manager 会检查 `.mailbox/<session-id>/<worker-id>/status.json` 已存在且含五个字段后，才认为握手完成；不要用终端回显或 send-keys 代替 status。
 
 ### Mailbox health gate
 
@@ -61,7 +61,9 @@ mailbox send --session <session-id> --from <worker-id> --to manager \
 
 ## v2 Direct Inbox
 
-正式 TASK、Manager 补充材料和 peer 消息都写入你的 `_mailbox/<session-id>/<worker-id>/inbox/`。这里的尖括号仅表示“填入 INIT 中的实际值”；文件路径必须使用这些真实 ID。Syncthing 直接同步。
+`.drafts/` is for agent work artifacts; `.mailbox/` is for agent-to-agent communication.
+
+正式 TASK、Manager 补充材料和 peer 消息都写入你的 `.mailbox/<session-id>/<worker-id>/inbox/`。这里的尖括号仅表示“填入 INIT 中的实际值”；文件路径必须使用这些真实 ID。Syncthing 直接同步。
 
 两阶段消费：`mailbox read`（inbox→processing，auto-claim）→ 处理 → `mailbox finalize`（processing→archive，校验 owner）。
 
@@ -106,7 +108,7 @@ The standalone mailbox/status CLI is authoritative. A tmux/oh-my-pi plugin, open
 
 ## status.json
 
-你只维护 `_mailbox/<session-id>/<worker-id>/status.json`。这里的 `<session-id>` 与 `<worker-id>` 必须替换为 INIT 给出的实际值。它必须始终是以下五字段的人类可读快照，禁止添加协议元数据或嵌入报告全文：
+你只维护 `.mailbox/<session-id>/<worker-id>/status.json`。这里的 `<session-id>` 与 `<worker-id>` 必须替换为 INIT 给出的实际值。它必须始终是以下五字段的人类可读快照，禁止添加协议元数据或嵌入报告全文：
 
 ```json
 {
@@ -171,7 +173,7 @@ SourceAnalysis 与 ClosedSourceReverse Worker 在完成前必须复核符号、�
 - **Corrupt JSON / self-validation failure**：`mailbox read` 会移入 `_corrupt/`。记录文件名并向 Manager 发 NOTICE；不要手改、恢复或删除它。
 - **Syncthing conflict**：跳过 `.sync-conflict-*`；通知原发送者通过 CLI 重发。不得把冲突文件改名成正常消息。
 - **Clock skew**：按 inbox 可见顺序处理；`created_at` 与文件名时间仅供诊断。发现明显偏差可 NOTICE `CLOCK_SKEW`，不能改时间戳。
-- **Unknown recipient**：先核对 Manager 提供的 session roster 与实际 `_mailbox/<session-id>/<worker-id>/inbox`，发送失败不得自行创建目录或换一个相似 ID。
+- **Unknown recipient**：先核对 Manager 提供的 session roster 与实际 `.mailbox/<session-id>/<worker-id>/inbox`，发送失败不得自行创建目录或换一个相似 ID。
 - **Status 写入失败**：保留 artifact，向 Manager 发 NOTICE；仍失败则停止扩展，避免出现"工作继续但状态不可见"。
 - **Crash recovery**：发现 `processing/` 中有过期消息（超过 300s lease），运行 `mailbox recover-stale` 自动将过期 claim 放回 inbox；`mailbox stats` 显示 `processing` 非零时应立即排查。不手移文件。
 

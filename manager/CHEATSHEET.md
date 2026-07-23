@@ -15,7 +15,7 @@ python3 scripts/tmux_worker.py mailbox send \
   --subject "<task>" --body "<full task + acceptance>"
 
 # 或直接用 standalone CLI（zero-dependency）
-MAILBOX_ROOT=_mailbox mailbox send \
+MAILBOX_ROOT=.mailbox mailbox send \
   --session <session-id> --from manager --to <agent-id> --kind TASK \
   --subject "<task>" --body "<full task>"
 
@@ -43,7 +43,7 @@ tmux send-keys -t <target> -l -- "MAILBOX_PENDING; check v2 inbox"
 tmux send-keys -t <target> C-m
 ```
 
-目录：`_mailbox/<session_id>/<agent>/{inbox,processing,archive,_corrupt}/`；外加 `_mailbox/<session_id>/session.json`。Worker→Manager、Worker→Worker、Manager→Worker 正式内容全部 direct inbox。
+目录：`.mailbox/<session_id>/<agent>/{inbox,processing,archive,_corrupt}/`；外加 `.mailbox/<session_id>/session.json`。Worker→Manager、Worker→Worker、Manager→Worker 正式内容全部 direct inbox。
 8 个必填字段：`session_id`、`from`、`to`、`subject`、`body`、`kind`、`msg_id`、`created_at`；3 个可选关联字段：`reply_to`、`run_id`、`request_id`。
 7 种 kind：TASK, REPORT, PROGRESS, EVIDENCE, QUESTION, RESPONSE, NOTICE。
 竞态保护：`mailbox read`（inbox→processing，auto-claim）→ 处理 → `mailbox finalize`（processing→archive）；`mailbox release` 回放；`mailbox recover-stale` 崩溃恢复。
@@ -81,7 +81,7 @@ python3 scripts/tmux_worker.py mailbox status --session <id> --agent <id> \
   --state BLOCKED --current-task "<task>" --last-conclusion "<brief reason>"
 ```
 
-`_mailbox/<session>/<agent>/status.json` **恰好四字段**：`state`、`current_task`、`last_conclusion`、`updated_at`。Manager 每 5 秒读 status；`BUSY` 不派新任务，`DONE/BLOCKED` 立即收取 Manager inbox 的 REPORT。`STALE` 只做诊断，不等于 IDLE。
+`.mailbox/<session>/<agent>/status.json` **恰好四字段**：`state`、`current_task`、`last_conclusion`、`updated_at`。Manager 每 5 秒读 status；`BUSY` 不派新任务，`DONE/BLOCKED` 立即收取 Manager inbox 的 REPORT。`STALE` 只做诊断，不等于 IDLE。
 
 ## Task headers
 

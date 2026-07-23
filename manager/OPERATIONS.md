@@ -9,7 +9,7 @@
 v2 mailbox 位于共享仓库，session 隔离：
 
 ```text
-_mailbox/<session_id>/
+.mailbox/<session_id>/
   session.json       # {manager, agents, created_at}
   manager/{inbox,processing,archive,_corrupt}/
   <agent-id>/{inbox,processing,archive,_corrupt}/
@@ -26,7 +26,7 @@ scripts/tmux_worker.py register --config workers.toml
 scripts/tmux_worker.py mailbox-roster --config workers.toml
 ```
 
-注册失败、收件人不在 roster 或 `_mailbox/<session>/<agent>/inbox` 不存在时停止发送，禁止自行创建一个"看起来正确"的 worker id。
+注册失败、收件人不在 roster 或 `.mailbox/<session>/<agent>/inbox` 不存在时停止发送，禁止自行创建一个"看起来正确"的 worker id。
 
 ## 2. 启动链
 
@@ -36,7 +36,7 @@ scripts/tmux_worker.py mailbox-roster --config workers.toml
 2. `SHELL_READY`：launch marker 校验 hostname。
 3. `CWD_VERIFIED`：launch marker 校验物理 cwd。
 4. `AGENT_STARTED`：仅 liveness。
-5. Worker 初始化后写 `_mailbox/<session>/<agent>/status.json` 为 `IDLE`；这才是 v2 可调度快照。
+5. Worker 初始化后写 `.mailbox/<session>/<agent>/status.json` 为 `IDLE`；这才是 v2 可调度快照。
 
 ```bash
 scripts/tmux_worker.py launch --worker <id> --config workers.toml --timeout 120
@@ -125,7 +125,7 @@ scripts/tmux_worker.py mailbox status --session <id> --agent <id> \
 
 Manager 监控循环：
 
-1. 每 5 秒读取每个 `_mailbox/<session>/<agent>/status.json`，同时读取 `mailbox stats` 的 inbox/archive/corrupt 计数；计数是 pending 诊断，不写进四字段 status。
+1. 每 5 秒读取每个 `.mailbox/<session>/<agent>/status.json`，同时读取 `mailbox stats` 的 inbox/archive/corrupt 计数；计数是 pending 诊断，不写进四字段 status。
 2. 若 plugin 健康，plugin 负责 peek→inject 和 BUSY/DONE/BLOCKED 更新；Manager 仍核对 status 与 REPORT。若 plugin 不健康，inbox count 增长时本地可发 wake，远程不依赖 send-keys，等待 Worker 的 manual fallback poll。
 3. DONE/BLOCKED：立即 drain Manager inbox（read→process→finalize），收取 final REPORT 和 artifact；收件后才能派下一任务。
 4. IDLE：可派发，但若有未处理 REPORT/archive，先完成收件。
