@@ -20,9 +20,19 @@ You are a worker agent. This file is your sole **protocol** source — not domai
 
 ## Launch and Identity
 
-Manager 仍负责 shell、cwd 与 agent 启动。INIT 必须明确提供实际的 `session_id`、`worker_id`、role profile 与 artifact root；收到 INIT 后保存这些值并完成兼容握手，随后立即用 standalone `mailbox status` 把自己的状态写成 `IDLE`。后续命令中的 `<session-id>` 与 `<worker-id>` 必须替换为 INIT 中给出的实际值，不能照抄占位符，也不要从其他 profile 推断身份。
+Manager 仍负责 shell、cwd 与 agent 启动。INIT 必须明确提供实际的 `session_id`、`worker_id`、role profile 与 artifact root；后续命令中的 `<session-id>` 与 `<worker-id>` 必须替换为 INIT 中给出的实际值，不能照抄占位符，也不要从其他 profile 推断身份。
 
-**Restored-session reset (`omp -c`)**：恢复的 session 可能带有 session-based protocol 之前的 stale IPC/conversation context。收到 INIT 后的第一个动作必须是丢弃所有此前的 mailbox paths、command names、protocol assumptions 和 IPC mechanisms；重新读取 `skill://tmux-agent-worker` 与 `skill://tmux-agent-manager` 的 CURRENT protocol。唯一有效的命令是 standalone `mailbox` CLI；唯一有效的路径是 `_mailbox/<session>/<agent>/inbox|processing|archive/`。不得引用 `scripts/tmux_worker.py`、`workers.toml`、`mailbox-v2-*`、outbox、relay、cursor 或 flat `_mailbox/<worker>/` 路径。
+### Fresh session
+
+新 omp session 没有旧上下文：按 INIT Handshake 接收正式 INIT，执行 `mailbox read --session <session-id> --agent <worker-id> --owner <worker-id> --json` → 校验身份 → `mailbox status --session <session-id> --agent <worker-id> --state IDLE --current-task "waiting for TASK" --last-conclusion "INIT accepted"` → `mailbox finalize --session <session-id> --agent <worker-id> --msg-id <id> --owner <worker-id>`，再等待正式 TASK。
+
+### Restored session (`omp -c`)
+
+恢复的 session 可能带有 session-based protocol 之前的 stale IPC/conversation context。**RESET 必须先于正式 INIT TASK**：收到 Manager 的 reset/wake prompt 后，第一个动作必须是丢弃所有此前的 mailbox paths、command names、protocol assumptions 和 IPC mechanisms；重新读取 `skill://tmux-agent-worker` 与 `skill://tmux-agent-manager` 的 CURRENT protocol。唯一有效的命令是 standalone `mailbox` CLI；唯一有效的路径是 `_mailbox/<session>/<agent>/inbox|processing|archive/`。不得引用 `scripts/tmux_worker.py`、`workers.toml`、`mailbox-v2-*`、outbox、relay、cursor 或 flat `_mailbox/<worker>/` 路径。用 `ls _mailbox/<session-id>/<worker-id>/inbox/` 验证实际 inbox，再执行正式 INIT Handshake；不要因旧上下文报告 “Inbox empty” 而改查 flat path。
+
+### Already initialized
+
+若 `_mailbox/<session-id>/<worker-id>/status.json` 已存在且 `state` 为 `IDLE`，说明 INIT 已完成。此时新的 INIT 是 **NO-OP**：不要重新读取 skills、不要重写 IDLE、不要再次发送或消费 INIT；只执行 `mailbox peek --session <session-id> --agent <worker-id> [--json]`，然后按正常 polling contract 用 `mailbox read` 处理新的 TASK。
 
 ## INIT Handshake
 
@@ -56,7 +66,7 @@ mailbox clear --session <session-id> --agent <worker-id>
 # 崩溃恢复：过期 processing→inbox
 mailbox recover-stale --session <session-id> --agent <worker-id>
 ```
-Standalone CLI 的命令名固定为 `session-init`、`send`、`peek`、`read`、`finalize`、`release`、`recover-stale`、`check`、`status`、`clear`、`stats`；所有命令直接调用 standalone `mailbox`，不要调用 runner wrapper。CLI 可执行文件位于 `~/src/tmux-agent-skills/tools/mailbox` 或 `~/.omp/plugins/node_modules/omp-mailbox-plugin/bin/mailbox`；两者均可，禁止使用 `scripts/tmux_worker.py`。
+Standalone CLI 的命令名固定为 `session-init`、`send`、`peek`、`read`、`finalize`、`release`、`recover-stale`、`check`、`status`、`clear`、`stats`；所有命令直接调用 standalone `mailbox`，不要调用 runner wrapper。Remote SSH setup may provide the executable at `~/.claude/bin/mailbox` (通常是 setup symlink), `~/src/tmux-agent-skills/tools/mailbox`, or `~/.omp/plugins/node_modules/omp-mailbox-plugin/bin/mailbox`; try these locations, and never use `scripts/tmux_worker.py`.
 
 消息 8 个必填字段：`session_id`、`from`、`to`、`subject`、`body`、`kind`、`msg_id`、`created_at`；3 个可选关联字段：`reply_to`、`run_id`、`request_id`。7 种 kind：`TASK`、`REPORT`、`PROGRESS`、`EVIDENCE`、`QUESTION`、`RESPONSE`、`NOTICE`。不要手写或编辑 JSON。修正旧消息必须发新消息，并用 `--reply-to <msg_id>` 回链。
 Mailbox REPORT/NOTICE/QUESTION content is **advisory** evidence and coordination; a TASK message is the formal v2 dispatch envelope, while `status.json` is the active-state snapshot. Neither free-form body text nor send-keys replaces the required status update.

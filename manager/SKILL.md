@@ -10,6 +10,32 @@ description: tmux-agent-manager v3 — 薄编排契约
 ## 1. 职责边界
 
 本 skill **只编排**，不做领域研究或证据判断。Manager 可读 `workers.toml`、Worker 产物、`_mailbox/<session>/<agent>/status.json` 与自己的 session manager inbox；禁止用 `capture-pane` 判断状态。`status.json` 是当前状态快照，正式结论以 Worker 发往 Manager inbox 的 `REPORT` 为准。
+## Manager Self-Initialization
+
+Before dispatching or waiting for any Worker, Manager MUST initialize its own identity and notification path:
+
+1. Re-read the current `skill://tmux-agent-manager` skill (and `skill://tmux-agent-worker` when interpreting Worker state); do not rely on restored conversation context.
+2. Set the actual session identity for the current run and activate the plugin environment:
+
+   ```bash
+   export OMP_SESSION_ID=<actual-session-id>
+   export OMP_WORKER_ID=manager
+   ```
+
+   Replace `<actual-session-id>` with the real session ID; never leave a placeholder or use a flat worker path.
+3. Write Manager's own five-field status snapshot:
+
+   ```bash
+   mailbox status --session <actual-session-id> --agent manager --state IDLE --current-task "waiting for REPORT" --last-conclusion "manager initialized"
+   ```
+
+4. Check for pre-existing reports before starting work:
+
+   ```bash
+   mailbox peek --session <actual-session-id> --agent manager [--json]
+   ```
+
+5. Start the configured mailbox plugin/watch or the documented polling loop for incoming Worker REPORTs. The plugin may notify/peek only; Manager must consume reports itself with `mailbox read` → process → `mailbox finalize`.
 
 ## 2. 当前通信模型
 
@@ -58,6 +84,13 @@ mailbox send \
 
 ### INIT 握手（每个 Worker 必须完成）
 
+### Target initialization scenarios
+
+- **Fresh Worker**：没有既有 session context，直接执行下方四步 INIT 握手。
+- **Restored Worker (`omp -c`)**：RESET prompt 必须先于正式 INIT TASK。先发送：`tmux send-keys -t <target> -l -- "RESET: forget ALL prior flat mailbox paths, dotai wrappers, relay/outbox/IPC logic, workers.toml assumptions, and mailbox-v2-* names. Re-read skill://tmux-agent-worker and skill://tmux-agent-manager. Use only standalone mailbox and session-based paths. Verify with ls _mailbox/<session-id>/<worker-id>/inbox/"`，再发送回车；远程没有本地 tmux 时经可用 runner 发送同一 prompt。收到确认或按可见 inbox 验证后，才执行正式 INIT send。
+- **Already-idle Worker**：若目标 `_mailbox/<session-id>/<worker-id>/status.json` 已存在且 `state=IDLE`，新的 INIT 是 **NO-OP**；不要重新发送/消费 INIT、不要要求重读 skill 或重写 IDLE，只执行 `mailbox peek --session <session-id> --agent <worker-id> [--json]`，并等待新的 TASK。
+
+
 1. **写入正式 INIT（a）**：Manager 用上面的 `mailbox send` 将 `kind=TASK`、`subject=INIT` 写入目标 Worker inbox；body 必须包含该 Worker 的实际 `session_id`、`worker_id`、role profile、artifact root 和兼容握手要求。
 2. **发送检查提示（b）**：紧接着向目标 pane 发同一身份信息的短提示，明确要求立即检查 inbox。目标支持 tmux 时使用：
 
@@ -92,7 +125,7 @@ mailbox recover-stale --session <session-id> --agent manager
 ## Plugin and runner integration (preferred, framework-neutral)
 
 The authoritative standalone CLI command set is `session-init`, `send`, `peek`, `read`, `finalize`, `release`, `recover-stale`, `check`, `status`, `clear`, and `stats`; invoke these names directly, never through a runner wrapper. A tmux/oh-my-pi plugin, opencode adapter, or another runner MAY invoke `mailbox peek` at safe boundaries for notification; the **plugin only notifies — never consumes**. The agent reads via `mailbox read`. No skill depends on private runner hooks.
-The standalone executable is available at `~/src/tmux-agent-skills/tools/mailbox` or `~/.omp/plugins/node_modules/omp-mailbox-plugin/bin/mailbox`; either path works. Do not route commands through `scripts/tmux_worker.py`.
+The standalone executable is available at `~/.claude/bin/mailbox` (setup symlink), `~/src/tmux-agent-skills/tools/mailbox`, or `~/.omp/plugins/node_modules/omp-mailbox-plugin/bin/mailbox`; try these locations, and never route commands through `scripts/tmux_worker.py`.
 
 Manager still polls each `status.json` and inbox statistics for observability. Adapter injection is not a substitute for final REPORT or artifact verification. If no adapter is available, the runner calls the standalone CLI at the documented boundaries. Remote SSH Worker formal communication uses the plugin/direct Syncthing path; an available runner may carry the INIT check prompt, but send-keys is never the payload or proof of delivery.
 
