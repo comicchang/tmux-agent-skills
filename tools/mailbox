@@ -1,68 +1,78 @@
 #!/usr/bin/env python3
-"""mailbox — v2 inbox commands (standalone, no dotai dependency)
+"""mailbox — session-based direct-inbox CLI (standalone, zero-dependency)
 
-Shared mailbox root via $MAILBOX_ROOT env or --root flag.
-Writes atomic JSON (tmp + os.replace). Syncthing-safe: rejects
-.sync-conflict-* and .tmp-* filenames.
+Shared root via $MAILBOX_ROOT env. Session directory layout:
+
+  $MAILBOX_ROOT/<session_id>/
+    session.json           # {manager, agents, created_at}
+    manager/inbox|processing|archive/
+    <agent>/inbox|processing|archive/status.json
 
 Commands:
-  send       Write message to recipient inbox (7 required fields)
-  peek       Non-consuming summary: pending count + message previews
-  check      Validate, archive consumed messages (idempotent with claim)
-  claim      Atomically claim a message for processing (→ processing/)
-  release    Release a claimed message back to inbox
-  status     Write 4-field status.json
-  clear      Delete archive (optionally prune _corrupt older than N days)
-  stats      Inbox/archive/corrupt counts
+  session-init  --session <id> --manager <id> --agents <id,id,...>
+  send          --session <id> --from <id> --to <id> --subject ... --body ...
+  peek          --session <id> --agent <id>
+  claim         --session <id> --agent <id> --msg-id <id> --owner <id>
+  finalize      --session <id> --agent <id> --msg-id <id> --owner <id>
+  release       --session <id> --agent <id> --msg-id <id>
+  check         --session <id> --agent <id>  (legacy: scan inbox only)
+  status        --session <id> --agent <id> --state ...
+  clear         --session <id> --agent <id>
+  stats         --session <id> --agent <id>
 
-Message JSON (7 required fields):
-  from, to, subject, body, kind, msg_id, created_at
+Message JSON (8 fields, 1 optional):
+  session_id, from, to, subject, body, kind, msg_id, created_at
+  [+ reply_to, run_id, request_id optional for correlation]
 
 Kinds: TASK, REPORT, PROGRESS, EVIDENCE, QUESTION, RESPONSE, NOTICE
 States: IDLE, BUSY, DONE, BLOCKED
 """
 
-import json, os, sys, argparse
+import json, os, sys, argparse, time
 from pathlib import Path
 from datetime import datetime, timezone
 
-# Valid vocabulary — kept in sync with manager/SKILL.md
 VALID_KINDS = {"TASK", "REPORT", "PROGRESS", "EVIDENCE", "QUESTION", "RESPONSE", "NOTICE"}
 VALID_STATES = {"IDLE", "BUSY", "DONE", "BLOCKED"}
-REQUIRED_FIELDS = {"from", "to", "subject", "body", "kind", "msg_id", "created_at"}
+REQUIRED_FIELDS = {"session_id", "from", "to", "subject", "body", "kind", "msg_id", "created_at"}
+LEASE_TIMEOUT_S = 300  # processing/ lease before stale recovery eligible
+AGENT_ID_RE = r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,31}$"
 
 
 def resolve_root():
-    """MAILBOX_ROOT env → ~/Dropbox/.../mi-docs/_mailbox (legacy default)."""
     return Path(os.environ.get("MAILBOX_ROOT") or
                 os.path.expanduser("~/Dropbox/logseq/pages/mi-docs/_mailbox"))
 
 
-def validate_message(msg, expected_recipient, filename):
-    """Full schema validation. Returns (True, "") or (False, reason)."""
-    if not isinstance(msg, dict):
-        return False, "not a JSON object"
-
-    missing = REQUIRED_FIELDS - set(msg.keys())
-    if missing:
-        return False, f"missing fields: {', '.join(sorted(missing))}"
-
-    if msg["kind"] not in VALID_KINDS:
-        return False, f"invalid kind: {msg['kind']}"
-    if msg["msg_id"] + ".json" != filename:
-        return False, f"msg_id mismatch: {msg['msg_id']} vs {filename}"
-    if msg["to"] != expected_recipient:
-        return False, f"recipient mismatch: {msg['to']} vs {expected_recipient}"
-
-    # Sanity: no path traversal in msg_id
-    if "/" in msg["msg_id"] or "\\" in msg["msg_id"]:
-        return False, f"invalid msg_id (contains path separator): {msg['msg_id']}"
-
-    return True, ""
+def _validate_agent_id(aid: str):
+    import re
+    if not re.match(AGENT_ID_RE, aid):
+        sys.exit(f"invalid agent id: {aid}")
 
 
-def list_messages(inbox):
-    """Return sorted list of .json files in inbox (excludes tmp/conflict)."""
+def session_dir(root: Path, session_id: str) -> Path:
+    _validate_agent_id(session_id)
+    return root / session_id
+
+
+def agent_dir(root: Path, session_id: str, agent_id: str) -> Path:
+    _validate_agent_id(agent_id)
+    return session_dir(root, session_id) / agent_id
+
+
+def agent_subdir(root: Path, session_id: str, agent_id: str, sub: str) -> Path:
+    return agent_dir(root, session_id, agent_id) / sub
+
+
+def _gen_msg_id(sender: str) -> str:
+    """Timestamp-based message ID with random suffix for collision safety."""
+    import random, string
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    return f"{sender}_{ts}_{suffix}"
+
+
+def list_messages(inbox: Path) -> list[Path]:
     if not inbox.exists():
         return []
     return sorted(
@@ -73,32 +83,91 @@ def list_messages(inbox):
         key=lambda f: f.stat().st_mtime)
 
 
+def validate_message(msg: dict, expected_agent: str, filename: str) -> tuple[bool, str]:
+    if not isinstance(msg, dict):
+        return False, "not a JSON object"
+    missing = REQUIRED_FIELDS - set(msg.keys())
+    if missing:
+        return False, f"missing fields: {', '.join(sorted(missing))}"
+    if msg["kind"] not in VALID_KINDS:
+        return False, f"invalid kind: {msg['kind']}"
+    if msg["msg_id"] + ".json" != filename:
+        return False, f"msg_id mismatch: {msg['msg_id']} vs {filename}"
+    if msg["to"] != expected_agent:
+        return False, f"recipient mismatch: {msg['to']} vs {expected_agent}"
+    if "/" in msg["msg_id"] or "\\" in msg["msg_id"]:
+        return False, f"invalid msg_id (path separator): {msg['msg_id']}"
+    return True, ""
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Commands
+# ═══════════════════════════════════════════════════════════════════════
+
+def cmd_session_init(args):
+    root = resolve_root()
+    sd = session_dir(root, args.session)
+    if sd.exists():
+        sys.exit(f"session already exists: {args.session}")
+    sd.mkdir(parents=True)
+
+    meta = {
+        "session_id": args.session,
+        "manager": args.manager,
+        "agents": sorted(set(args.agents.split(","))),
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    tmp = sd / ".tmp-session.json"
+    tmp.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+    os.replace(str(tmp), str(sd / "session.json"))
+
+    # Pre-create all agent directories
+    for aid in meta["agents"]:
+        for sub in ["inbox", "processing", "archive"]:
+            agent_subdir(root, args.session, aid, sub).mkdir(parents=True, exist_ok=True)
+    # Manager directory
+    for sub in ["inbox", "processing", "archive"]:
+        agent_subdir(root, args.session, args.manager, sub).mkdir(parents=True, exist_ok=True)
+
+    print(f"session {args.session} created: manager={args.manager}, agents={meta['agents']}")
+
+
 def cmd_send(args):
     root = resolve_root()
-    inbox = root / args.to / "inbox"
-    if not inbox.exists():
-        sys.exit(f"recipient not registered: {args.to}")
+    sd = session_dir(root, args.session)
+    if not sd.exists():
+        sys.exit(f"session not found: {args.session}")
 
-    # Sender roster validation: sender must have an inbox directory
-    sender_inbox = root / args.from_worker / "inbox"
+    inbox = agent_subdir(root, args.session, args.to, "inbox")
+    if not inbox.exists():
+        sys.exit(f"agent not in session: {args.to}")
+    sender_inbox = agent_subdir(root, args.session, args.from_worker, "inbox")
     if not sender_inbox.exists():
         sys.exit(f"sender not in roster: {args.from_worker}")
 
     if args.kind not in VALID_KINDS:
         sys.exit(f"invalid kind: {args.kind}")
 
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    base_id = f"{args.from_worker}_{ts}"
-    msg_id = base_id
-    collision = 1
+    msg_id = _gen_msg_id(args.from_worker)
     while (inbox / f"{msg_id}.json").exists():
-        msg_id = f"{base_id}-{collision}"; collision += 1
+        msg_id = _gen_msg_id(args.from_worker)
 
-    msg = {"from": args.from_worker, "to": args.to, "subject": args.subject,
-           "body": args.body, "kind": args.kind, "msg_id": msg_id,
-           "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    msg = {
+        "session_id": args.session,
+        "from": args.from_worker,
+        "to": args.to,
+        "subject": args.subject,
+        "body": args.body,
+        "kind": args.kind,
+        "msg_id": msg_id,
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
     if args.reply_to:
         msg["reply_to"] = args.reply_to
+    if args.run_id:
+        msg["run_id"] = args.run_id
+    if args.request_id:
+        msg["request_id"] = args.request_id
 
     dest = inbox / f"{msg_id}.json"
     tmp = inbox / f".tmp-{msg_id}.json"
@@ -109,7 +178,7 @@ def cmd_send(args):
 
 def cmd_peek(args):
     root = resolve_root()
-    inbox = root / args.worker / "inbox"
+    inbox = agent_subdir(root, args.session, args.agent, "inbox")
     files = list_messages(inbox)
     if not files:
         json.dump({"pending": 0, "messages": []}, sys.stdout)
@@ -127,19 +196,142 @@ def cmd_peek(args):
                 "msg_id": msg.get("msg_id", f.stem),
             })
         except (json.JSONDecodeError, UnicodeDecodeError):
-            summaries.append({"from": "?", "kind": "?", "subject": "(unreadable)",
-                              "msg_id": f.stem})
+            summaries.append({"from": "?", "kind": "?", "subject": "(unreadable)", "msg_id": f.stem})
 
     result = {"pending": len(files), "messages": summaries}
     json.dump(result, sys.stdout, ensure_ascii=False)
 
 
-def cmd_check(args):
+def cmd_claim(args):
+    """Move msg from inbox → processing/ with owner + lease timestamp."""
     root = resolve_root()
-    worker_dir = root / args.worker
-    inbox = worker_dir / "inbox"
-    archive = worker_dir / "archive"
-    corrupt = worker_dir / "_corrupt"
+    inbox = agent_subdir(root, args.session, args.agent, "inbox")
+    processing = agent_subdir(root, args.session, args.agent, "processing")
+    files = list_messages(inbox)
+
+    target = None
+    for f in files:
+        if f.stem == args.msg_id:
+            target = f
+            break
+    if target is None:
+        sys.exit(f"msg not found in inbox: {args.msg_id}")
+
+    processing.mkdir(parents=True, exist_ok=True)
+    dest = processing / target.name
+
+    # Write claim metadata alongside the message
+    claim_meta = {
+        "owner": args.owner,
+        "claimed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "msg_id": args.msg_id,
+    }
+    claim_file = processing / f".claim-{args.msg_id}.json"
+    tmp = processing / f".tmp-claim-{args.msg_id}.json"
+    tmp.write_text(json.dumps(claim_meta))
+    os.replace(str(tmp), str(claim_file))
+
+    try:
+        os.replace(str(target), str(dest))
+    except OSError as e:
+        # Clean up claim file on failure
+        claim_file.unlink(missing_ok=True)
+        sys.exit(f"claim failed: {e}")
+
+    print(f"claimed → processing/{target.name} (owner={args.owner})")
+
+
+def cmd_finalize(args):
+    """Move msg from processing/ → archive/ — validates ownership from claim file."""
+    root = resolve_root()
+    processing = agent_subdir(root, args.session, args.agent, "processing")
+    archive = agent_subdir(root, args.session, args.agent, "archive")
+
+    target = processing / f"{args.msg_id}.json"
+    claim_file = processing / f".claim-{args.msg_id}.json"
+
+    if not target.exists():
+        sys.exit(f"msg not in processing/: {args.msg_id}")
+
+    # Verify ownership via claim file
+    if claim_file.exists():
+        try:
+            claim = json.loads(claim_file.read_bytes())
+            if claim.get("owner") != args.owner:
+                sys.exit(f"owner mismatch: claim={claim.get('owner')} vs {args.owner}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            sys.exit(f"corrupt claim file for {args.msg_id}")
+    else:
+        print(f"warning: no claim file for {args.msg_id}, finalizing without ownership check",
+              file=sys.stderr)
+
+    archive.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(str(target), str(archive / target.name))
+    except OSError as e:
+        sys.exit(f"finalize failed: {e}")
+
+    # Clean up claim metadata
+    claim_file.unlink(missing_ok=True)
+    print(f"finalized → archive/{target.name}")
+
+
+def cmd_release(args):
+    """Move msg from processing/ back to inbox."""
+    root = resolve_root()
+    inbox = agent_subdir(root, args.session, args.agent, "inbox")
+    processing = agent_subdir(root, args.session, args.agent, "processing")
+    target = processing / f"{args.msg_id}.json"
+    claim_file = processing / f".claim-{args.msg_id}.json"
+
+    if not target.exists():
+        sys.exit(f"msg not found in processing/: {args.msg_id}")
+    try:
+        os.replace(str(target), str(inbox / target.name))
+    except OSError as e:
+        sys.exit(f"release failed: {e}")
+
+    claim_file.unlink(missing_ok=True)
+    print(f"released → inbox/{target.name}")
+
+
+def cmd_recover_stale(args):
+    """Recover stale claims: processing/ messages with expired leases → inbox."""
+    root = resolve_root()
+    processing_dir = agent_subdir(root, args.session, args.agent, "processing")
+    inbox = agent_subdir(root, args.session, args.agent, "inbox")
+
+    if not processing_dir.exists():
+        print("no processing/ directory")
+        return
+
+    recovered = 0
+    cutoff = datetime.now(timezone.utc).timestamp() - LEASE_TIMEOUT_S
+    for cf in sorted(processing_dir.glob(".claim-*.json")):
+        try:
+            claim = json.loads(cf.read_bytes())
+            claimed_at_s = claim.get("claimed_at", "")
+            if claimed_at_s:
+                claimed_ts = datetime.fromisoformat(claimed_at_s).timestamp()
+                if claimed_ts < cutoff:
+                    msg_id = claim.get("msg_id", cf.stem.replace(".claim-", ""))
+                    msg_file = processing_dir / f"{msg_id}.json"
+                    if msg_file.exists():
+                        os.replace(str(msg_file), str(inbox / msg_file.name))
+                        cf.unlink()
+                        recovered += 1
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            pass
+
+    print(f"recovered {recovered} stale claim(s)")
+
+
+def cmd_check(args):
+    """Legacy: validate + archive from inbox only (no processing/ awareness)."""
+    root = resolve_root()
+    inbox = agent_subdir(root, args.session, args.agent, "inbox")
+    archive = agent_subdir(root, args.session, args.agent, "archive")
+    corrupt = agent_subdir(root, args.session, args.agent, "_corrupt")
 
     files = list_messages(inbox)
     if not files:
@@ -151,7 +343,7 @@ def cmd_check(args):
         filename = entry.name
         try:
             msg = json.loads(entry.read_bytes())
-            ok, reason = validate_message(msg, args.worker, filename)
+            ok, reason = validate_message(msg, args.agent, filename)
             if not ok:
                 raise ValueError(reason)
         except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
@@ -177,60 +369,22 @@ def cmd_check(args):
         print(f"[+{remaining} more in inbox]", file=sys.stderr)
 
 
-def cmd_claim(args):
-    """Move msg from inbox→processing/ for exclusive consumption."""
-    root = resolve_root()
-    inbox = root / args.worker / "inbox"
-    processing = root / args.worker / "processing"
-    files = list_messages(inbox)
-
-    target = None
-    for f in files:
-        if f.stem == args.msg_id:
-            target = f
-            break
-
-    if target is None:
-        sys.exit(f"msg not found in inbox: {args.msg_id}")
-
-    processing.mkdir(parents=True, exist_ok=True)
-    try:
-        os.replace(str(target), str(processing / target.name))
-    except OSError as e:
-        sys.exit(f"claim failed (already claimed?): {e}")
-
-    print(f"claimed → processing/{target.name}")
-
-
-def cmd_release(args):
-    """Move msg from processing/ back to inbox."""
-    root = resolve_root()
-    inbox = root / args.worker / "inbox"
-    processing = root / args.worker / "processing"
-    target = processing / f"{args.msg_id}.json"
-    if not target.exists():
-        sys.exit(f"msg not found in processing/: {args.msg_id}")
-    try:
-        os.replace(str(target), str(inbox / target.name))
-    except OSError as e:
-        sys.exit(f"release failed: {e}")
-    print(f"released → inbox/{target.name}")
-
-
 def cmd_status(args):
     root = resolve_root()
     if args.state not in VALID_STATES:
         sys.exit(f"invalid state: {args.state}")
+
+    ad = agent_dir(root, args.session, args.agent)
+    ad.mkdir(parents=True, exist_ok=True)
+
     status = {
         "state": args.state,
         "current_task": args.current_task or "",
         "last_conclusion": args.last_conclusion or "",
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    worker_dir = root / args.worker
-    worker_dir.mkdir(parents=True, exist_ok=True)
-    dest = worker_dir / "status.json"
-    tmp = worker_dir / ".tmp-status.json"
+    dest = ad / "status.json"
+    tmp = ad / ".tmp-status.json"
     tmp.write_text(json.dumps(status, indent=2, ensure_ascii=False))
     os.replace(str(tmp), str(dest))
     print(f"status: {args.state}")
@@ -238,91 +392,127 @@ def cmd_status(args):
 
 def cmd_clear(args):
     root = resolve_root()
-    archive = root / args.worker / "archive"
-    count = 0
-    if archive.exists():
-        for f in archive.glob("*.json"):
-            f.unlink(); count += 1
-    if args.prune_corrupt:
-        cdir = root / args.worker / "_corrupt"
-        if cdir.exists():
-            cutoff = datetime.now().timestamp() - args.older_than_days * 86400
-            for f in cdir.glob("*.json"):
-                if f.stat().st_mtime < cutoff:
-                    f.unlink(); count += 1
-    print(f"cleared {count}")
+    ad = agent_dir(root, args.session, args.agent)
+    total = 0
+    for sub in ["archive", "_corrupt"]:
+        d = ad / sub
+        if d.exists():
+            for f in d.glob("*.json"):
+                f.unlink()
+                total += 1
+    if args.prune_stale:
+        # Also recover stale processing claims
+        cmd_recover_stale(args)
+    print(f"cleared {total}")
 
 
 def cmd_stats(args):
     root = resolve_root()
-    for d in ["inbox", "archive", "processing", "_corrupt"]:
-        p = root / args.worker / d
+    ad = agent_dir(root, args.session, args.agent)
+    for d in ["inbox", "processing", "archive", "_corrupt"]:
+        p = ad / d
         c = len(list(p.glob("*.json"))) if p.exists() else 0
         print(f"{d}: {c}")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════
+
 def main():
-    p = argparse.ArgumentParser(description="mailbox v2 CLI (standalone)")
+    p = argparse.ArgumentParser(description="mailbox — session-based direct-inbox CLI")
     sub = p.add_subparsers(dest="cmd")
+
+    # session-init
+    si = sub.add_parser("session-init")
+    si.add_argument("--session", required=True)
+    si.add_argument("--manager", required=True)
+    si.add_argument("--agents", required=True, help="comma-separated agent IDs")
 
     # send
     s = sub.add_parser("send")
+    s.add_argument("--session", required=True)
     s.add_argument("--from", required=True, dest="from_worker")
     s.add_argument("--to", required=True)
     s.add_argument("--subject", required=True)
     s.add_argument("--body", required=True)
     s.add_argument("--kind", default="REPORT", choices=sorted(VALID_KINDS))
     s.add_argument("--reply-to", default="")
+    s.add_argument("--run-id", default="")
+    s.add_argument("--request-id", default="")
 
-    # peek (non-consuming)
+    # peek
     pk = sub.add_parser("peek")
-    pk.add_argument("--worker", required=True)
+    pk.add_argument("--session", required=True)
+    pk.add_argument("--agent", required=True)
     pk.add_argument("--max-messages", type=int, default=5)
     pk.add_argument("--max-subject", type=int, default=80)
 
-    # check (consume — validate + archive)
-    c = sub.add_parser("check")
-    c.add_argument("--worker", required=True)
-    c.add_argument("--json", action="store_true")
-    c.add_argument("--max-messages", type=int, default=0)
-
     # claim
     cl = sub.add_parser("claim")
-    cl.add_argument("--worker", required=True)
+    cl.add_argument("--session", required=True)
+    cl.add_argument("--agent", required=True)
     cl.add_argument("--msg-id", required=True)
+    cl.add_argument("--owner", required=True)
+
+    # finalize
+    fn = sub.add_parser("finalize")
+    fn.add_argument("--session", required=True)
+    fn.add_argument("--agent", required=True)
+    fn.add_argument("--msg-id", required=True)
+    fn.add_argument("--owner", required=True)
 
     # release
     rl = sub.add_parser("release")
-    rl.add_argument("--worker", required=True)
+    rl.add_argument("--session", required=True)
+    rl.add_argument("--agent", required=True)
     rl.add_argument("--msg-id", required=True)
+
+    # recover-stale
+    rs = sub.add_parser("recover-stale")
+    rs.add_argument("--session", required=True)
+    rs.add_argument("--agent", required=True)
+
+    # check
+    c = sub.add_parser("check")
+    c.add_argument("--session", required=True)
+    c.add_argument("--agent", required=True)
+    c.add_argument("--json", action="store_true")
+    c.add_argument("--max-messages", type=int, default=0)
 
     # status
     st = sub.add_parser("status")
-    st.add_argument("--worker", required=True)
+    st.add_argument("--session", required=True)
+    st.add_argument("--agent", required=True)
     st.add_argument("--state", required=True, choices=sorted(VALID_STATES))
     st.add_argument("--current-task", default="")
     st.add_argument("--last-conclusion", default="")
 
     # clear
     clr = sub.add_parser("clear")
-    clr.add_argument("--worker", required=True)
-    clr.add_argument("--prune-corrupt", action="store_true")
-    clr.add_argument("--older-than-days", type=int, default=30)
+    clr.add_argument("--session", required=True)
+    clr.add_argument("--agent", required=True)
+    clr.add_argument("--prune-stale", action="store_true")
 
     # stats
     ss = sub.add_parser("stats")
-    ss.add_argument("--worker", required=True)
+    ss.add_argument("--session", required=True)
+    ss.add_argument("--agent", required=True)
 
     args = p.parse_args()
-    if args.cmd == "send": cmd_send(args)
-    elif args.cmd == "check": cmd_check(args)
+    if args.cmd == "session-init": cmd_session_init(args)
+    elif args.cmd == "send": cmd_send(args)
     elif args.cmd == "peek": cmd_peek(args)
     elif args.cmd == "claim": cmd_claim(args)
+    elif args.cmd == "finalize": cmd_finalize(args)
     elif args.cmd == "release": cmd_release(args)
+    elif args.cmd == "recover-stale": cmd_recover_stale(args)
+    elif args.cmd == "check": cmd_check(args)
     elif args.cmd == "status": cmd_status(args)
     elif args.cmd == "clear": cmd_clear(args)
     elif args.cmd == "stats": cmd_stats(args)
-    else: p.print_help()
+    else:
+        p.print_help()
 
 
 if __name__ == "__main__":

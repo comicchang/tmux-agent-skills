@@ -1,48 +1,56 @@
 # tmux-agent-skills
 
-OMP skills + standalone CLI for **tmux-agent-manager v3** — thin orchestration contract for multi-agent file-system IPC via Syncthing.
+OMP skills + standalone CLI for **tmux-agent-manager v3** — session-based direct-inbox IPC via Syncthing.
 
 ```
-Manager:   poll status.json → dispatch TASK → monitor
-Workers:   mailbox send/peek/check → self-report status
+Manager:   session-init → dispatch TASK → poll status → manager-wait → manager-ack
+Workers:   mailbox send/peek/claim/finalize → self-report status
 Syncthing: cross-machine delivery (no relay daemon)
+```
+
+## Directory Layout
+
+```
+$MAILBOX_ROOT/
+  <session_id>/
+    session.json          # {manager, agents, created_at}
+    manager/inbox|processing|archive/
+    <agent>/inbox|processing|archive/status.json
 ```
 
 ## Contents
 
 | Path | Purpose |
 |---|---|
-| `manager/SKILL.md` | Full Manager protocol (v2 mailbox, dispatch, monitoring) |
-| `manager/OPERATIONS.md` | Operations guide (launch, reconcile, recovery) |
+| `manager/SKILL.md` | Full Manager protocol |
+| `manager/OPERATIONS.md` | Operations guide |
 | `manager/CHEATSHEET.md` | Quick command reference |
-| `worker/SKILL.md` | Worker protocol (INIT/TASK, mailbox, status lifecycle) |
-| `tools/mailbox` | Standalone CLI — send/peek/check/claim/release/status/clear/stats (Python, zero deps) |
+| `worker/SKILL.md` | Worker protocol |
+| `tools/mailbox` | Standalone CLI — all commands (Python, zero deps) |
 | `tools/mailbox-hook` | Runner integration — pending detection |
 
 ## Mailbox CLI
 
 ```
-mailbox send    --from <id> --to <id> --subject "..." --body "..." --kind TASK [--reply-to <msg_id>]
-mailbox peek    --worker <id>              # non-consuming: pending count + message previews
-mailbox check   --worker <id>              # validate, archive (--json for machine output)
-mailbox claim   --worker <id> --msg-id <id> # atomic claim → processing/ (exclusive)
-mailbox release --worker <id> --msg-id <id> # release claim back to inbox
-mailbox status  --worker <id> --state BUSY --current-task "..."
-mailbox clear   --worker <id> --prune-corrupt --older-than-days 30
-mailbox stats   --worker <id>              # inbox/archive/processing/_corrupt counts
+mailbox session-init  --session <id> --manager <id> --agents <id,...>
+mailbox send          --session <id> --from <id> --to <id> --subject "..." --body "..."
+                      --kind TASK [--reply-to <id>] [--run-id <id>] [--request-id <id>]
+mailbox peek          --session <id> --agent <id>              # non-consuming summary
+mailbox claim         --session <id> --agent <id> --msg-id <id> --owner <id>
+mailbox finalize      --session <id> --agent <id> --msg-id <id> --owner <id>
+mailbox release       --session <id> --agent <id> --msg-id <id>
+mailbox recover-stale --session <id> --agent <id>              # recover expired claims
+mailbox check         --session <id> --agent <id>              # validate + archive (legacy)
+mailbox status        --session <id> --agent <id> --state BUSY
+mailbox clear         --session <id> --agent <id> [--prune-stale]
+mailbox stats         --session <id> --agent <id>
 ```
 
-**Message kinds:** TASK, REPORT, PROGRESS, EVIDENCE, QUESTION, RESPONSE, NOTICE.
-**7 required fields:** `from`, `to`, `subject`, `body`, `kind`, `msg_id`, `created_at`.
+**Message kinds**: TASK, REPORT, PROGRESS, EVIDENCE, QUESTION, RESPONSE, NOTICE.
+**8 required fields**: `session_id`, `from`, `to`, `subject`, `body`, `kind`, `msg_id`, `created_at`.
+**Optional correlation**: `reply_to`, `run_id`, `request_id`.
 
-Validation rules (enforced by `mailbox check`):
-- All 7 fields present + kinds valid
-- `msg_id` matches filename
-- Recipient matches inbox owner (cross-write detection)
-- No path separators in `msg_id`
-- Malformed/corrupt → `_corrupt/` with stderr diagnostic
-
-Configuration: `$MAILBOX_ROOT` env (defaults to `~/Dropbox/logseq/pages/mi-docs/_mailbox`).
+**Two-stage consumption**: `claim` (inbox→processing, records owner+lease) → `finalize` (processing→archive, validates ownership). `release` returns to inbox. `recover-stale` recovers expired claims (default 300s lease).
 
 ## Installation
 
@@ -51,27 +59,11 @@ Configuration: `$MAILBOX_ROOT` env (defaults to `~/Dropbox/logseq/pages/mi-docs/
 
 ## Notification Strategy
 
-| Worker Type | Mechanism |
+| Role | Mechanism |
 |---|---|
-| Local (tmux pane) | OMP `agent_end` + 30s idle poll + optional send-keys wake |
-| Remote (SSH) | OMP hook + periodic polling only (no send-keys) |
-| All | Runner calls `mailbox peek` at task boundaries, `mailbox check` for consumption |
-
-## Plugin Integration
-
-The `omp-mailbox-plugin` provides zero-latency Bun.watch notification with a 30s timer fallback. It calls `mailbox peek` (non-consuming), deduplicates via `msg_id`, and injects summaries at safe agent boundaries.
-
-## Directory Layout
-
-```
-$MAILBOX_ROOT/
-  {worker_id}/
-    inbox/        ← Others write here (Syncthing)
-    archive/      ← Read + validated messages
-    processing/   ← Claimed by consumer (exclusive, claim/release)
-    _corrupt/     ← Unparseable messages
-    status.json   ← {"state":"BUSY","current_task":"...","last_conclusion":"..."}
-```
+| Local Worker | OMP `agent_end` + 30s idle poll + optional send-keys wake |
+| Remote Worker | OMP hook + periodic polling only (no send-keys) |
+| Manager | `manager-poll --watch` + `manager-wait` + `manager-ack` |
 
 ## License
 
