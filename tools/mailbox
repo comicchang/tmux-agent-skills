@@ -202,43 +202,58 @@ def cmd_peek(args):
     json.dump(result, sys.stdout, ensure_ascii=False)
 
 
-def cmd_claim(args):
-    """Move msg from inbox → processing/ with owner + lease timestamp."""
+def cmd_read(args):
+    """Read oldest unprocessed message + auto-claim to processing/.
+
+    Outputs the full message JSON to stdout. If no messages, prints nothing.
+    This is the primary consumption command — replaces claim+peek with one step.
+    """
     root = resolve_root()
     inbox = agent_subdir(root, args.session, args.agent, "inbox")
     processing = agent_subdir(root, args.session, args.agent, "processing")
     files = list_messages(inbox)
 
-    target = None
-    for f in files:
-        if f.stem == args.msg_id:
-            target = f
-            break
-    if target is None:
-        sys.exit(f"msg not found in inbox: {args.msg_id}")
+    if not files:
+        return
+
+    target = files[0]  # oldest message
+    try:
+        msg = json.loads(target.read_bytes())
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        corrupt = agent_subdir(root, args.session, args.agent, "_corrupt")
+        corrupt.mkdir(parents=True, exist_ok=True)
+        os.replace(str(target), str(corrupt / target.name))
+        print(f"CORRUPT: {target.name} ({e})", file=sys.stderr)
+        sys.exit(1)
 
     processing.mkdir(parents=True, exist_ok=True)
     dest = processing / target.name
 
-    # Write claim metadata alongside the message
+    # Write claim metadata
     claim_meta = {
         "owner": args.owner,
         "claimed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "msg_id": args.msg_id,
+        "msg_id": target.stem,
     }
-    claim_file = processing / f".claim-{args.msg_id}.json"
-    tmp = processing / f".tmp-claim-{args.msg_id}.json"
+    claim_file = processing / f".claim-{target.stem}.json"
+    tmp = processing / f".tmp-claim-{target.stem}.json"
     tmp.write_text(json.dumps(claim_meta))
     os.replace(str(tmp), str(claim_file))
 
     try:
         os.replace(str(target), str(dest))
     except OSError as e:
-        # Clean up claim file on failure
         claim_file.unlink(missing_ok=True)
-        sys.exit(f"claim failed: {e}")
+        sys.exit(f"read (claim) failed: {e}")
 
-    print(f"claimed → processing/{target.name} (owner={args.owner})")
+    # Output message to stdout for agent consumption
+    if args.json:
+        json.dump(msg, sys.stdout, ensure_ascii=False)
+    else:
+        print(f"FROM: {msg['from']}  KIND: {msg.get('kind','?')}")
+        print(f"SUBJECT: {msg['subject']}")
+        print(f"BODY: {msg['body']}")
+
 
 
 def cmd_finalize(args):
@@ -274,7 +289,6 @@ def cmd_finalize(args):
     # Clean up claim metadata
     claim_file.unlink(missing_ok=True)
     print(f"finalized → archive/{target.name}")
-
 
 def cmd_release(args):
     """Move msg from processing/ back to inbox."""
@@ -448,12 +462,12 @@ def main():
     pk.add_argument("--max-messages", type=int, default=5)
     pk.add_argument("--max-subject", type=int, default=80)
 
-    # claim
-    cl = sub.add_parser("claim")
-    cl.add_argument("--session", required=True)
-    cl.add_argument("--agent", required=True)
-    cl.add_argument("--msg-id", required=True)
-    cl.add_argument("--owner", required=True)
+    # read (auto-claim on read)
+    rd = sub.add_parser("read")
+    rd.add_argument("--session", required=True)
+    rd.add_argument("--agent", required=True)
+    rd.add_argument("--owner", required=True)
+    rd.add_argument("--json", action="store_true", help="output full JSON")
 
     # finalize
     fn = sub.add_parser("finalize")
@@ -503,7 +517,7 @@ def main():
     if args.cmd == "session-init": cmd_session_init(args)
     elif args.cmd == "send": cmd_send(args)
     elif args.cmd == "peek": cmd_peek(args)
-    elif args.cmd == "claim": cmd_claim(args)
+    elif args.cmd == "read": cmd_read(args)
     elif args.cmd == "finalize": cmd_finalize(args)
     elif args.cmd == "release": cmd_release(args)
     elif args.cmd == "recover-stale": cmd_recover_stale(args)
