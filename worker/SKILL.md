@@ -20,42 +20,55 @@ You are a worker agent. This file is your sole **protocol** source — not domai
 
 ## Launch and Identity
 
-Manager 仍负责 shell、cwd 与 agent 启动。收到 INIT 后保存 `worker_id`、role profile、artifact root 与 worker script，并完成兼容握手；随后立即把自己的 status 写成 `IDLE`。不要从其他 profile 推断身份。
+Manager 仍负责 shell、cwd 与 agent 启动。收到 INIT 后保存 `session_id`、`worker_id`、role profile、artifact root 与 worker script，并完成兼容握手；随后立即把自己的 status 写成 `IDLE`。不要从其他 profile 推断身份。
 
 ## v2 Direct Inbox
 
-正式 TASK、Manager 补充材料和 peer 消息都写入你的 `_mailbox/{{WORKER_ID}}/inbox/`。Syncthing 直接同步，**没有 relay daemon、outbox 或 cursor**。
+正式 TASK、Manager 补充材料和 peer 消息都写入你的 `_mailbox/{{SESSION_ID}}/{{WORKER_ID}}/inbox/`。Syncthing 直接同步，**没有 relay daemon、outbox 或 cursor**。
+
+两阶段消费：`mailbox read`（inbox→processing，auto-claim）→ 处理 → `mailbox finalize`（processing→archive，校验 owner）。
 
 ```bash
-# 每次调用只读取、验证并归档最早一封
-{{WORKER_SCRIPT}} mailbox-v2-check --worker {{WORKER_ID}} --json
+# 每次调用只读取、验证并原子移到 processing（按 owner+lease 自动声明）
+{{WORKER_SCRIPT}} mailbox read \
+  --session {{SESSION_ID}} --agent {{WORKER_ID}} --owner {{WORKER_ID}} [--json]
+
+# 处理完成后归档
+{{WORKER_SCRIPT}} mailbox finalize \
+  --session {{SESSION_ID}} --agent {{WORKER_ID}} --msg-id <id> --owner {{WORKER_ID}}
 
 # 直接写收件人的 inbox
-{{WORKER_SCRIPT}} mailbox-v2-send \
-  --from {{WORKER_ID}} --to manager \
+{{WORKER_SCRIPT}} mailbox send \
+  --session {{SESSION_ID}} --from {{WORKER_ID}} --to manager \
   --kind REPORT --subject "<short result>" --body "<conclusion and artifact refs>"
 
-{{WORKER_SCRIPT}} mailbox-v2-stats --worker {{WORKER_ID}}
-{{WORKER_SCRIPT}} mailbox-v2-clear --worker {{WORKER_ID}}
+# 非消费查询与统计
+{{WORKER_SCRIPT}} mailbox peek --session {{SESSION_ID}} --agent {{WORKER_ID}} [--json]
+{{WORKER_SCRIPT}} mailbox stats --session {{SESSION_ID}} --agent {{WORKER_ID}}
+{{WORKER_SCRIPT}} mailbox clear --session {{SESSION_ID}} --agent {{WORKER_ID}}
+
+# 崩溃恢复：过期 processing→inbox
+{{WORKER_SCRIPT}} mailbox recover-stale --session {{SESSION_ID}} --agent {{WORKER_ID}}
 ```
 
-消息必填字段只有 `from`、`to`、`subject`、`body`、`created_at`、`kind`、`msg_id`。不要手写或编辑 JSON。修正旧消息必须发新消息，并用 `--reply-to <msg_id>` 回链。
+消息 8 个必填字段：`session_id`、`from`、`to`、`subject`、`body`、`kind`、`msg_id`、`created_at`；3 个可选关联字段：`reply_to`、`run_id`、`request_id`。7 种 kind：`TASK`、`REPORT`、`PROGRESS`、`EVIDENCE`、`QUESTION`、`RESPONSE`、`NOTICE`。不要手写或编辑 JSON。修正旧消息必须发新消息，并用 `--reply-to <msg_id>` 回链。
 Mailbox REPORT/NOTICE/QUESTION content is **advisory** evidence and coordination; a TASK message is the formal v2 dispatch envelope, while `status.json` is the active-state snapshot. Neither free-form body text nor send-keys replaces the required status update.
 
 ## Runner adapter integration (preferred, framework-neutral)
 
-The standalone mailbox/status CLI is authoritative. A tmux/oh-my-pi plugin, opencode adapter, or another runner MAY invoke it at task start/end, idle, and checkpoints; it must not rely on private framework hooks. An adapter may watch, validate, read→archive, and inject messages, then call `status_update`. If no adapter is available, use the manual CLI fallback below; never run two archive consumers concurrently.
+The standalone mailbox/status CLI is authoritative. A tmux/oh-my-pi plugin, opencode adapter, or another runner MAY invoke `mailbox peek` at safe boundaries for notification; the **plugin only notifies — never consumes**. The agent reads via `mailbox read`. It must not rely on private framework hooks and must not run two archive consumers concurrently. If no adapter is available, use the manual CLI fallback below.
 
 ## TASK Processing
 
-1. On TASK arrival, accept only a validated `kind=TASK` from the expected Manager; verify Role/Domain/Requires/Anchors and acceptance criteria. If an adapter delivered it, inspect the injected message; otherwise run `mailbox-v2-check`.
-2. At task start, ensure `BUSY` was written by the adapter or call `mailbox-v2-status --state BUSY` yourself. Local `MAILBOX_PENDING` is only an optional wake; remote SSH Workers have no local tmux socket and rely on mailbox/status polling.
-3. During work, an adapter may inject at safe checkpoints. In fallback mode, call `mailbox-v2-check` at each major boundary and after long tools, one message at a time.
+1. On TASK arrival, accept only a validated `kind=TASK` from the expected Manager; verify Role/Domain/Requires/Anchors and acceptance criteria. If an adapter delivered it, inspect the injected message; otherwise run `mailbox read`.
+2. At task start, ensure `BUSY` was written by the adapter or call `mailbox status --state BUSY` yourself. Local `MAILBOX_PENDING` is only an optional wake; remote SSH Workers have no local tmux socket and rely on mailbox/status polling.
+3. During work, an adapter may inject at safe checkpoints. In fallback mode, call `mailbox read` at each major boundary and after long tools, one message at a time.
 4. Wrong target, insufficient capability, or underspecified task: send a `NOTICE`, set `BLOCKED` through the adapter or status CLI, and stop; never silently execute.
+5. 处理完成后调用 `mailbox finalize` 将消息从 processing 归档到 archive。
 
 ## status.json
 
-你只维护 `_mailbox/{{WORKER_ID}}/status.json`。它必须始终是以下四字段的人类可读快照，禁止添加协议元数据或嵌入报告全文：
+你只维护 `_mailbox/{{SESSION_ID}}/{{WORKER_ID}}/status.json`。它必须始终是以下四字段的人类可读快照，禁止添加协议元数据或嵌入报告全文：
 
 ```json
 {
@@ -75,9 +88,9 @@ The standalone mailbox/status CLI is authoritative. A tmux/oh-my-pi plugin, open
 
 ## Polling Contract
 
-Plugin mode: no manual poll is required; the plugin owns inbox watch, validation, read→archive, safe-boundary injection, and status transitions. The Worker still reviews injected messages before acting and must not clear archive until the task is complete.
+Plugin mode: no manual poll is required; the plugin owns inbox watch, validation, peek→inject, and status transitions. The Worker still reviews injected messages before acting and must not clear archive until the task is complete.
 
-Fallback mode: check inbox at task start, each major phase, before final REPORT, and after terminal status. Local `MAILBOX_PENDING` can accelerate a check; remote SSH Workers must actively poll and never use send-keys. Process one message at a time, then clear archive only after all work is handled.
+Fallback mode: `mailbox read` at task start, each major phase, before final REPORT, and after terminal status. Local `MAILBOX_PENDING` can accelerate a check; remote SSH Workers must actively poll and never use send-keys. Process one message at a time (read→process→finalize), then clear archive only after all work is handled.
 
 ## Multi-Mode Participation
 
@@ -99,30 +112,32 @@ SourceAnalysis 与 ClosedSourceReverse Worker 在完成前必须复核符号、�
 ### Done
 
 1. 写完并校验 artifact。
-2. 在终态前再轮询 inbox，处理所有与本任务有关的消息。
+2. 在终态前再轮询 inbox，`mailbox read` 处理所有与本任务有关的消息。
 3. 向 Manager 发送 final `REPORT`，包含 artifact 路径、摘要、验证状态和所有 inference/pending 项。
-4. 调用 `mailbox-v2-status --state DONE --current-task "..." --last-conclusion "..."`。
-5. 再检查一次 inbox；确认处理完成后清 archive，等待下一封 TASK。
+4. 调用 `mailbox status --state DONE --current-task "..." --last-conclusion "..."`。
+5. 再检查一次 inbox；确认处理完成后 `mailbox finalize` 归档最后一封、`mailbox clear`，等待下一封 TASK。
 
 ### Blocked
 
 1. 保存已有 artifact 与证据边界。
 2. 向 Manager 发送 `REPORT` 或 `NOTICE`，明确 reason code：`MISSING_BINARY`、`IDA_TIMEOUT`、`MISSING_IR`、`DEPENDENCY_UNRESOLVED`、`EVIDENCE_WALL`、`TOOL_UNAVAILABLE`、`PERMISSION_DENIED`、`SYNC_FAILED` 或 `UNKNOWN`。
-3. 调用 `mailbox-v2-status --state BLOCKED --current-task "..." --last-conclusion "<brief reason>"`。
-4. 检查 inbox，清理已处理 archive，停止扩展。
+3. 调用 `mailbox status --state BLOCKED --current-task "..." --last-conclusion "<brief reason>"`。
+4. 检查 inbox，处理并 finalize 已读消息，`mailbox clear`，停止扩展。
 
 ## Error Handling
 
-- **Corrupt JSON / self-validation failure**：`mailbox-v2-check` 会移入 `_corrupt/`。记录文件名并向 Manager 发 NOTICE；不要手改、恢复或删除它。
+- **Corrupt JSON / self-validation failure**：`mailbox read` 会移入 `_corrupt/`。记录文件名并向 Manager 发 NOTICE；不要手改、恢复或删除它。
 - **Syncthing conflict**：跳过 `.sync-conflict-*`；通知原发送者通过 CLI 重发。不得把冲突文件改名成正常消息。
 - **Clock skew**：按 inbox 可见顺序处理；`created_at` 与文件名时间仅供诊断。发现明显偏差可 NOTICE `CLOCK_SKEW`，不能改时间戳。
 - **Unknown recipient**：先运行 `mailbox-roster` 验证，发送失败不得自行创建目录或换一个相似 ID。
-- **Status 写入失败**：保留 artifact，向 Manager 发 NOTICE；仍失败则停止扩展，避免出现“工作继续但状态不可见”。
+- **Status 写入失败**：保留 artifact，向 Manager 发 NOTICE；仍失败则停止扩展，避免出现"工作继续但状态不可见"。
+- **Crash recovery**：发现 processing/ 中有过期消息，运行 `mailbox recover-stale` 自动恢复；不手移文件。
 
 ## Prevention Rules
 
 - 永远用 CLI；不要手写 mailbox/status JSON。
 - 永远验证 `--to`；只写收件人 inbox，永远不写别人的 status/archive。
+- 两阶段消费：`mailbox read`（inbox→processing）→ 处理 → `mailbox finalize`（processing→archive）；`mailbox release` 用于放回；`mailbox recover-stale` 用于崩溃恢复。
 - 远程 SSH Worker 不使用 send-keys 与任何参与方通信；Manager/peer 通信完全走 mailbox，活跃度完全读 status.json。
 - 不覆盖已发送消息，不复用文件名/msg_id，不恢复 relay/cursor/ack。
 - 不用 mailbox 消息代替 artifact；不把大文件或敏感原文塞入 body。
@@ -134,6 +149,6 @@ SourceAnalysis 与 ClosedSourceReverse Worker 在完成前必须复核符号、�
 
 ## Legacy (v1)
 
-兼容旧 Manager 时，以下命令仍可使用但均为 LEGACY：`event-emit ACK/DONE/BLOCKED/WORKING`、`mailbox-send`、`mailbox-check`、`mailbox-relay`、control-envelope TASK、queue auto-drain。v1 的 `mailbox_outbox_dir`/`mailbox_inbox_dir`、relay、cursor、mark-read 与 B-plane-only 状态不得带入新的 v2 TASK。
+v1 使用 control envelope、B-plane ACK/DONE/BLOCKED、`mailbox/outbox`→relay→`mailbox/inbox`、cursor/unread/mark-read。兼容旧 Manager 时，以下命令仍可使用但均为 LEGACY：`event-emit ACK/DONE/BLOCKED/WORKING`、`mailbox-send`、`mailbox-check`、`mailbox-relay`、control-envelope TASK、queue auto-drain。v1 架构不得带入新的 v2 TASK。
 
 若收到 v1 envelope，按旧请求完成其 ACK/terminal event，同时仍维护 v2 `status.json` 并向 Manager v2 inbox 发 REPORT；不得为兼容而让新消息重新走 relay。

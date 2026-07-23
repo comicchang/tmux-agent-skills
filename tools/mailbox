@@ -12,15 +12,16 @@ Commands:
   session-init  --session <id> --manager <id> --agents <id,id,...>
   send          --session <id> --from <id> --to <id> --subject ... --body ...
   peek          --session <id> --agent <id>
-  claim         --session <id> --agent <id> --msg-id <id> --owner <id>
+  read          --session <id> --agent <id> --owner <id> [--json]
   finalize      --session <id> --agent <id> --msg-id <id> --owner <id>
-  release       --session <id> --agent <id> --msg-id <id>
+  release       --session <id> --agent <id> --msg-id <id> --owner <id>
+  recover-stale --session <id> --agent <id>
   check         --session <id> --agent <id>  (legacy: scan inbox only)
   status        --session <id> --agent <id> --state ...
   clear         --session <id> --agent <id>
   stats         --session <id> --agent <id>
 
-Message JSON (8 fields, 1 optional):
+Message JSON (8 required fields):
   session_id, from, to, subject, body, kind, msg_id, created_at
   [+ reply_to, run_id, request_id optional for correlation]
 
@@ -100,6 +101,34 @@ def validate_message(msg: dict, expected_agent: str, filename: str) -> tuple[boo
     return True, ""
 
 
+def _validate_msg_schema(msg: dict) -> tuple[bool, str]:
+    """Full schema validation of a message dict for all 8 required fields + kinds."""
+    if not isinstance(msg, dict):
+        return False, "not a JSON object"
+    missing = REQUIRED_FIELDS - set(msg.keys())
+    if missing:
+        return False, f"missing fields: {', '.join(sorted(missing))}"
+    if msg["kind"] not in VALID_KINDS:
+        return False, f"invalid kind: {msg['kind']}"
+    if not isinstance(msg["subject"], str):
+        return False, f"subject must be string"
+    if not isinstance(msg["body"], str):
+        return False, f"body must be string"
+    if not isinstance(msg["session_id"], str):
+        return False, f"session_id must be string"
+    if not isinstance(msg["from"], str):
+        return False, f"from must be string"
+    if not isinstance(msg["to"], str):
+        return False, f"to must be string"
+    if not isinstance(msg["msg_id"], str):
+        return False, f"msg_id must be string"
+    if not isinstance(msg["created_at"], str):
+        return False, f"created_at must be string"
+    if "/" in msg["msg_id"] or "\\" in msg["msg_id"]:
+        return False, f"invalid msg_id (path separator): {msg['msg_id']}"
+    return True, ""
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Commands
 # ═══════════════════════════════════════════════════════════════════════
@@ -169,6 +198,11 @@ def cmd_send(args):
     if args.request_id:
         msg["request_id"] = args.request_id
 
+    # P0 Fix 6: validate all 8 fields + schema before writing
+    ok, reason = _validate_msg_schema(msg)
+    if not ok:
+        sys.exit(f"send validation failed: {reason}")
+
     dest = inbox / f"{msg_id}.json"
     tmp = inbox / f".tmp-{msg_id}.json"
     tmp.write_text(json.dumps(msg, indent=2, ensure_ascii=False))
@@ -207,57 +241,75 @@ def cmd_read(args):
 
     Outputs the full message JSON to stdout. If no messages, prints nothing.
     This is the primary consumption command — replaces claim+peek with one step.
+
+    P0 Fix 1: verifies msg.session_id == args.session before claiming.
+    P0 Fix 4: if os.replace fails (concurrent race), tries next inbox file.
     """
     root = resolve_root()
     inbox = agent_subdir(root, args.session, args.agent, "inbox")
     processing = agent_subdir(root, args.session, args.agent, "processing")
-    files = list_messages(inbox)
+    corrupt_dir = agent_subdir(root, args.session, args.agent, "_corrupt")
 
-    if not files:
-        return
+    while True:
+        files = list_messages(inbox)
+        if not files:
+            return
 
-    target = files[0]  # oldest message
-    try:
-        msg = json.loads(target.read_bytes())
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        corrupt = agent_subdir(root, args.session, args.agent, "_corrupt")
-        corrupt.mkdir(parents=True, exist_ok=True)
-        os.replace(str(target), str(corrupt / target.name))
-        print(f"CORRUPT: {target.name} ({e})", file=sys.stderr)
-        sys.exit(1)
+        target = files[0]  # oldest message
+        msg = None
+        try:
+            msg = json.loads(target.read_bytes())
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            corrupt_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(str(target), str(corrupt_dir / target.name))
+            print(f"CORRUPT: {target.name} ({e})", file=sys.stderr)
+            continue  # P0 Fix 4: try next file on JSON parse failure too
 
-    processing.mkdir(parents=True, exist_ok=True)
-    dest = processing / target.name
+        # P0 Fix 1: verify session_id matches
+        if msg.get("session_id") != args.session:
+            corrupt_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(str(target), str(corrupt_dir / target.name))
+            print(f"CORRUPT: {target.name} (session_id mismatch: {msg.get('session_id')} vs {args.session})",
+                  file=sys.stderr)
+            continue  # try next file
 
-    # Write claim metadata
-    claim_meta = {
-        "owner": args.owner,
-        "claimed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "msg_id": target.stem,
-    }
-    claim_file = processing / f".claim-{target.stem}.json"
-    tmp = processing / f".tmp-claim-{target.stem}.json"
-    tmp.write_text(json.dumps(claim_meta))
-    os.replace(str(tmp), str(claim_file))
+        processing.mkdir(parents=True, exist_ok=True)
+        dest = processing / target.name
 
-    try:
-        os.replace(str(target), str(dest))
-    except OSError as e:
-        claim_file.unlink(missing_ok=True)
-        sys.exit(f"read (claim) failed: {e}")
+        # Write claim metadata
+        claim_meta = {
+            "owner": args.owner,
+            "claimed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "msg_id": target.stem,
+        }
+        claim_file = processing / f".claim-{target.stem}.json"
+        tmp_claim = processing / f".tmp-claim-{target.stem}.json"
+        tmp_claim.write_text(json.dumps(claim_meta))
+        os.replace(str(tmp_claim), str(claim_file))
 
-    # Output message to stdout for agent consumption
-    if args.json:
-        json.dump(msg, sys.stdout, ensure_ascii=False)
-    else:
-        print(f"FROM: {msg['from']}  KIND: {msg.get('kind','?')}")
-        print(f"SUBJECT: {msg['subject']}")
-        print(f"BODY: {msg['body']}")
+        try:
+            os.replace(str(target), str(dest))
+        except OSError as e:
+            # P0 Fix 4: concurrent race — clean up and try next file
+            claim_file.unlink(missing_ok=True)
+            print(f"read (claim) conflict on {target.name}: {e}, trying next", file=sys.stderr)
+            continue
 
+        # Output message to stdout for agent consumption
+        if args.json:
+            json.dump(msg, sys.stdout, ensure_ascii=False)
+        else:
+            print(f"FROM: {msg['from']}  KIND: {msg.get('kind','?')}")
+            print(f"SUBJECT: {msg['subject']}")
+            print(f"BODY: {msg['body']}")
+        return  # success — done
 
 
 def cmd_finalize(args):
-    """Move msg from processing/ → archive/ — validates ownership from claim file."""
+    """Move msg from processing/ → archive/ — validates ownership from claim file.
+
+    P0 Fix 2: fail closed — sys.exit if claim file is missing.
+    """
     root = resolve_root()
     processing = agent_subdir(root, args.session, args.agent, "processing")
     archive = agent_subdir(root, args.session, args.agent, "archive")
@@ -268,17 +320,17 @@ def cmd_finalize(args):
     if not target.exists():
         sys.exit(f"msg not in processing/: {args.msg_id}")
 
+    # P0 Fix 2: fail closed — claim file must exist
+    if not claim_file.exists():
+        sys.exit(f"no claim file for {args.msg_id} — refusing to finalize")
+
     # Verify ownership via claim file
-    if claim_file.exists():
-        try:
-            claim = json.loads(claim_file.read_bytes())
-            if claim.get("owner") != args.owner:
-                sys.exit(f"owner mismatch: claim={claim.get('owner')} vs {args.owner}")
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            sys.exit(f"corrupt claim file for {args.msg_id}")
-    else:
-        print(f"warning: no claim file for {args.msg_id}, finalizing without ownership check",
-              file=sys.stderr)
+    try:
+        claim = json.loads(claim_file.read_bytes())
+        if claim.get("owner") != args.owner:
+            sys.exit(f"owner mismatch: claim={claim.get('owner')} vs {args.owner}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        sys.exit(f"corrupt claim file for {args.msg_id}")
 
     archive.mkdir(parents=True, exist_ok=True)
     try:
@@ -290,8 +342,12 @@ def cmd_finalize(args):
     claim_file.unlink(missing_ok=True)
     print(f"finalized → archive/{target.name}")
 
+
 def cmd_release(args):
-    """Move msg from processing/ back to inbox."""
+    """Move msg from processing/ back to inbox.
+
+    P0 Fix 3: verify .claim file owner matches --owner, reject mismatch.
+    """
     root = resolve_root()
     inbox = agent_subdir(root, args.session, args.agent, "inbox")
     processing = agent_subdir(root, args.session, args.agent, "processing")
@@ -300,6 +356,19 @@ def cmd_release(args):
 
     if not target.exists():
         sys.exit(f"msg not found in processing/: {args.msg_id}")
+
+    # P0 Fix 3: verify claim file owner
+    if claim_file.exists():
+        try:
+            claim = json.loads(claim_file.read_bytes())
+            if claim.get("owner") != args.owner:
+                sys.exit(f"owner mismatch on release: claim={claim.get('owner')} vs {args.owner}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            sys.exit(f"corrupt claim file for {args.msg_id}")
+    elif args.owner:
+        # If --owner was provided but no claim file exists, reject
+        sys.exit(f"no claim file for {args.msg_id} — refusing to release")
+
     try:
         os.replace(str(target), str(inbox / target.name))
     except OSError as e:
@@ -384,6 +453,7 @@ def cmd_check(args):
 
 
 def cmd_status(args):
+    """P0 Fix 5: includes session_id in status.json."""
     root = resolve_root()
     if args.state not in VALID_STATES:
         sys.exit(f"invalid state: {args.state}")
@@ -392,6 +462,7 @@ def cmd_status(args):
     ad.mkdir(parents=True, exist_ok=True)
 
     status = {
+        "session_id": args.session,
         "state": args.state,
         "current_task": args.current_task or "",
         "last_conclusion": args.last_conclusion or "",
@@ -476,11 +547,12 @@ def main():
     fn.add_argument("--msg-id", required=True)
     fn.add_argument("--owner", required=True)
 
-    # release
+    # release (P0 Fix 3: added --owner)
     rl = sub.add_parser("release")
     rl.add_argument("--session", required=True)
     rl.add_argument("--agent", required=True)
     rl.add_argument("--msg-id", required=True)
+    rl.add_argument("--owner", required=True)
 
     # recover-stale
     rs = sub.add_parser("recover-stale")
