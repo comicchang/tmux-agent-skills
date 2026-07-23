@@ -113,13 +113,20 @@ def check(session_id: str, agent_id: str) -> dict:
         results["checks"].append({"name": "status_rw", "ok": False, "detail": str(e)})
         results["pass"] = False
 
-    # 8. OMP env vars (advisory)
-    omp_sid = os.environ.get("OMP_SESSION_ID", "")
-    omp_wid = os.environ.get("OMP_WORKER_ID", "")
-    ok = omp_sid == session_id and omp_wid == agent_id
-    results["checks"].append({"name": "omp_env", "ok": ok,
-                              "detail": f"OMP_SESSION_ID={'set' if omp_sid else 'MISSING'}, OMP_WORKER_ID={'set' if omp_wid else 'MISSING'}"})
-
+    # 8. Identity registration (file or env)
+    identity_path = Path.home() / ".omp" / agent_id / "mailbox-identity.json"
+    if identity_path.exists():
+        try:
+            id_data = json.loads(identity_path.read_bytes())
+            ok = (id_data.get("session_id") == session_id and
+                  (id_data.get("worker_id") == agent_id or id_data.get("workerId") == agent_id))
+            results["checks"].append({"name": "identity_file", "ok": ok,
+                                      "detail": f"file present, match={'OK' if ok else 'MISMATCH'}"})
+        except Exception as e:
+            results["checks"].append({"name": "identity_file", "ok": False, "detail": str(e)})
+    else:
+        results["checks"].append({"name": "identity_file", "ok": False,
+                                  "detail": f"no identity file at {identity_path}"})
     return results
 
 
