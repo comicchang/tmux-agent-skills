@@ -38,6 +38,27 @@ Manager 仍负责 shell、cwd 与 agent 启动。INIT 必须明确提供实际�
 
 Manager 先通过 standalone `mailbox send` 写入 `kind=TASK`、`subject=INIT` 的正式 INIT，再用 `send-keys`（或远程 runner 可用的等价交互提示）提醒你检查 inbox；提示不是任务正文。收到提示后立即执行 `mailbox read --session <session-id> --agent <worker-id> --owner <worker-id> --json`，验证 INIT 中的实际身份与 role profile，执行 `mailbox status --session <session-id> --agent <worker-id> --state IDLE --current-task "waiting for TASK" --last-conclusion "INIT accepted"`，然后用该消息的 `<id>` 执行 `mailbox finalize --session <session-id> --agent <worker-id> --msg-id <id> --owner <worker-id>`。Manager 会检查 `_mailbox/<session-id>/<worker-id>/status.json` 已存在且含五个字段后，才认为握手完成；不要用终端回显或 send-keys 代替 status。
 
+### Mailbox health gate
+
+After consuming INIT and writing `IDLE`, the Worker MUST verify that the standalone CLI can see the session inbox before proceeding:
+
+```bash
+# Verify plugin/CLI can detect messages; expected JSON includes pending and messages
+mailbox peek --session <session-id> --agent <worker-id> [--json]
+# Expected shape: {"pending": N, "messages": [...]}
+
+# Verify the IDLE status is still present
+mailbox status --session <session-id> --agent <worker-id> --state IDLE
+```
+
+If `mailbox peek` fails, is not found, or produces no output, do NOT proceed with TASK work. Send the Manager a `NOTICE` describing the CLI/connectivity failure, then wait for repair or instructions:
+
+```bash
+mailbox send --session <session-id> --from <worker-id> --to manager \
+  --kind NOTICE --subject "MAILBOX_HEALTH_FAILED" \
+  --body "mailbox peek failed or returned no output; CLI/session inbox is not verified"
+```
+
 ## v2 Direct Inbox
 
 正式 TASK、Manager 补充材料和 peer 消息都写入你的 `_mailbox/<session-id>/<worker-id>/inbox/`。这里的尖括号仅表示“填入 INIT 中的实际值”；文件路径必须使用这些真实 ID。Syncthing 直接同步。
@@ -66,7 +87,7 @@ mailbox clear --session <session-id> --agent <worker-id>
 # 崩溃恢复：过期 processing→inbox
 mailbox recover-stale --session <session-id> --agent <worker-id>
 ```
-Standalone CLI 的命令名固定为 `session-init`、`send`、`peek`、`read`、`finalize`、`release`、`recover-stale`、`check`、`status`、`clear`、`stats`；所有命令直接调用 standalone `mailbox`，不要调用 runner wrapper。Remote SSH setup may provide the executable at `~/.claude/bin/mailbox` (通常是 setup symlink), `~/src/tmux-agent-skills/tools/mailbox`, or `~/.omp/plugins/node_modules/omp-mailbox-plugin/bin/mailbox`; try these locations, and never use `scripts/tmux_worker.py`.
+Standalone CLI 的命令名固定为 `session-init`、`send`、`peek`、`read`、`finalize`、`release`、`recover-stale`、`check`、`status`、`clear`、`stats`；所有命令直接调用 standalone `mailbox`，不要调用 runner wrapper。CLI resolution order: (1) bundled plugin `~/.omp/plugins/node_modules/omp-mailbox-plugin/bin/mailbox`; (2) PATH command `mailbox`（若已 symlink 到 `~/.claude/bin/mailbox`）；(3) skills repo `~/src/dotai/external/tmux-agent-skills/tools/mailbox`。Remote SSH Worker 应按此顺序尝试，禁止使用 `scripts/tmux_worker.py`。
 
 消息 8 个必填字段：`session_id`、`from`、`to`、`subject`、`body`、`kind`、`msg_id`、`created_at`；3 个可选关联字段：`reply_to`、`run_id`、`request_id`。7 种 kind：`TASK`、`REPORT`、`PROGRESS`、`EVIDENCE`、`QUESTION`、`RESPONSE`、`NOTICE`。不要手写或编辑 JSON。修正旧消息必须发新消息，并用 `--reply-to <msg_id>` 回链。
 Mailbox REPORT/NOTICE/QUESTION content is **advisory** evidence and coordination; a TASK message is the formal v2 dispatch envelope, while `status.json` is the active-state snapshot. Neither free-form body text nor send-keys replaces the required status update.

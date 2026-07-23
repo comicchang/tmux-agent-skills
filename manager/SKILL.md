@@ -10,6 +10,7 @@ description: tmux-agent-manager v3 — 薄编排契约
 ## 1. 职责边界
 
 本 skill **只编排**，不做领域研究或证据判断。Manager 可读 `workers.toml`、Worker 产物、`_mailbox/<session>/<agent>/status.json` 与自己的 session manager inbox；禁止用 `capture-pane` 判断状态。`status.json` 是当前状态快照，正式结论以 Worker 发往 Manager inbox 的 `REPORT` 为准。
+
 ## Manager Self-Initialization
 
 Before dispatching or waiting for any Worker, Manager MUST initialize its own identity and notification path:
@@ -23,19 +24,20 @@ Before dispatching or waiting for any Worker, Manager MUST initialize its own id
    ```
 
    Replace `<actual-session-id>` with the real session ID; never leave a placeholder or use a flat worker path.
-3. Write Manager's own five-field status snapshot:
-
-   ```bash
-   mailbox status --session <actual-session-id> --agent manager --state IDLE --current-task "waiting for REPORT" --last-conclusion "manager initialized"
-   ```
-
-4. Check for pre-existing reports before starting work:
+3. Check the Manager inbox before declaring the Manager idle:
 
    ```bash
    mailbox peek --session <actual-session-id> --agent manager [--json]
    ```
 
-5. Start the configured mailbox plugin/watch or the documented polling loop for incoming Worker REPORTs. The plugin may notify/peek only; Manager must consume reports itself with `mailbox read` → process → `mailbox finalize`.
+4. If `pending` is greater than zero, process every pre-existing REPORT/NOTICE before declaring IDLE: use `mailbox read --session <actual-session-id> --agent manager --owner manager --json`, verify the report/artifact, then `mailbox finalize --session <actual-session-id> --agent manager --msg-id <id> --owner manager`; repeat until the inbox is empty. A failed peek or unreadable inbox is a startup failure, not an idle state.
+5. After the inbox is drained, write Manager's own five-field status snapshot:
+
+   ```bash
+   mailbox status --session <actual-session-id> --agent manager --state IDLE --current-task "waiting for REPORT" --last-conclusion "manager initialized"
+   ```
+
+6. Start the configured mailbox plugin/watch or the documented polling loop for incoming Worker REPORTs. The plugin may notify/peek only; Manager must consume reports itself with `mailbox read` → process → `mailbox finalize`.
 
 ## 2. 当前通信模型
 
@@ -125,7 +127,7 @@ mailbox recover-stale --session <session-id> --agent manager
 ## Plugin and runner integration (preferred, framework-neutral)
 
 The authoritative standalone CLI command set is `session-init`, `send`, `peek`, `read`, `finalize`, `release`, `recover-stale`, `check`, `status`, `clear`, and `stats`; invoke these names directly, never through a runner wrapper. A tmux/oh-my-pi plugin, opencode adapter, or another runner MAY invoke `mailbox peek` at safe boundaries for notification; the **plugin only notifies — never consumes**. The agent reads via `mailbox read`. No skill depends on private runner hooks.
-The standalone executable is available at `~/.claude/bin/mailbox` (setup symlink), `~/src/tmux-agent-skills/tools/mailbox`, or `~/.omp/plugins/node_modules/omp-mailbox-plugin/bin/mailbox`; try these locations, and never route commands through `scripts/tmux_worker.py`.
+CLI resolution order is: (1) bundled plugin `~/.omp/plugins/node_modules/omp-mailbox-plugin/bin/mailbox`; (2) PATH command `mailbox` (if symlinked to `~/.claude/bin/mailbox`); (3) skills repo `~/src/dotai/external/tmux-agent-skills/tools/mailbox`. Try these locations in order; never route commands through `scripts/tmux_worker.py`.
 
 Manager still polls each `status.json` and inbox statistics for observability. Adapter injection is not a substitute for final REPORT or artifact verification. If no adapter is available, the runner calls the standalone CLI at the documented boundaries. Remote SSH Worker formal communication uses the plugin/direct Syncthing path; an available runner may carry the INIT check prompt, but send-keys is never the payload or proof of delivery.
 
