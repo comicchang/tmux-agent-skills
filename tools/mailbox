@@ -101,7 +101,7 @@ def validate_message(msg: dict, expected_agent: str, filename: str) -> tuple[boo
     return True, ""
 
 
-def _validate_msg_schema(msg: dict) -> tuple[bool, str]:
+def _validate_msg_schema(msg: dict, expected_session_id: str = None) -> tuple[bool, str]:
     """Full schema validation of a message dict for all 8 required fields + kinds."""
     if not isinstance(msg, dict):
         return False, "not a JSON object"
@@ -112,10 +112,16 @@ def _validate_msg_schema(msg: dict) -> tuple[bool, str]:
         return False, f"invalid kind: {msg['kind']}"
     if not isinstance(msg["subject"], str):
         return False, f"subject must be string"
+    if not msg["subject"].strip():
+        return False, "subject must be non-empty"
     if not isinstance(msg["body"], str):
         return False, f"body must be string"
+    if not msg["body"].strip():
+        return False, "body must be non-empty"
     if not isinstance(msg["session_id"], str):
         return False, f"session_id must be string"
+    if expected_session_id is not None and msg["session_id"] != expected_session_id:
+        return False, f"session_id mismatch: {msg['session_id']} vs {expected_session_id}"
     if not isinstance(msg["from"], str):
         return False, f"from must be string"
     if not isinstance(msg["to"], str):
@@ -141,13 +147,17 @@ def cmd_session_init(args):
     sd.mkdir(parents=True)
 
     meta = {
+        "protocol_version": "2",
         "session_id": args.session,
         "manager": args.manager,
         "agents": sorted(set(args.agents.split(","))),
         "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     tmp = sd / ".tmp-session.json"
-    tmp.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+    with open(tmp, "w") as f:
+        f.write(json.dumps(meta, indent=2, ensure_ascii=False))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(str(tmp), str(sd / "session.json"))
 
     # Pre-create all agent directories
@@ -202,10 +212,12 @@ def cmd_send(args):
     ok, reason = _validate_msg_schema(msg)
     if not ok:
         sys.exit(f"send validation failed: {reason}")
-
     dest = inbox / f"{msg_id}.json"
     tmp = inbox / f".tmp-{msg_id}.json"
-    tmp.write_text(json.dumps(msg, indent=2, ensure_ascii=False))
+    with open(tmp, "w") as f:
+        f.write(json.dumps(msg, indent=2, ensure_ascii=False))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(str(tmp), str(dest))
     print(f"sent → {args.to}/inbox/{msg_id}.json")
 
@@ -265,12 +277,12 @@ def cmd_read(args):
             print(f"CORRUPT: {target.name} ({e})", file=sys.stderr)
             continue  # P0 Fix 4: try next file on JSON parse failure too
 
-        # P0 Fix 1: verify session_id matches
-        if msg.get("session_id") != args.session:
+        # P1 Fix 3: full schema validation before claiming (types, sizes, kind, session_id)
+        ok, reason = _validate_msg_schema(msg, args.session)
+        if not ok:
             corrupt_dir.mkdir(parents=True, exist_ok=True)
             os.replace(str(target), str(corrupt_dir / target.name))
-            print(f"CORRUPT: {target.name} (session_id mismatch: {msg.get('session_id')} vs {args.session})",
-                  file=sys.stderr)
+            print(f"CORRUPT: {target.name} (schema: {reason})", file=sys.stderr)
             continue  # try next file
 
         processing.mkdir(parents=True, exist_ok=True)
@@ -284,7 +296,10 @@ def cmd_read(args):
         }
         claim_file = processing / f".claim-{target.stem}.json"
         tmp_claim = processing / f".tmp-claim-{target.stem}.json"
-        tmp_claim.write_text(json.dumps(claim_meta))
+        with open(tmp_claim, "w") as fc:
+            fc.write(json.dumps(claim_meta))
+            fc.flush()
+            os.fsync(fc.fileno())
         os.replace(str(tmp_claim), str(claim_file))
 
         try:
@@ -470,7 +485,10 @@ def cmd_status(args):
     }
     dest = ad / "status.json"
     tmp = ad / ".tmp-status.json"
-    tmp.write_text(json.dumps(status, indent=2, ensure_ascii=False))
+    with open(tmp, "w") as f:
+        f.write(json.dumps(status, indent=2, ensure_ascii=False))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(str(tmp), str(dest))
     print(f"status: {args.state}")
 

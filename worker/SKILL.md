@@ -24,7 +24,7 @@ Manager 仍负责 shell、cwd 与 agent 启动。收到 INIT 后保存 `session_
 
 ## v2 Direct Inbox
 
-正式 TASK、Manager 补充材料和 peer 消息都写入你的 `_mailbox/{{SESSION_ID}}/{{WORKER_ID}}/inbox/`。Syncthing 直接同步，**没有 relay daemon、outbox 或 cursor**。
+正式 TASK、Manager 补充材料和 peer 消息都写入你的 `_mailbox/{{SESSION_ID}}/{{WORKER_ID}}/inbox/`。Syncthing 直接同步。
 
 两阶段消费：`mailbox read`（inbox→processing，auto-claim）→ 处理 → `mailbox finalize`（processing→archive，校验 owner）。
 
@@ -42,7 +42,7 @@ Manager 仍负责 shell、cwd 与 agent 启动。收到 INIT 后保存 `session_
   --session {{SESSION_ID}} --from {{WORKER_ID}} --to manager \
   --kind REPORT --subject "<short result>" --body "<conclusion and artifact refs>"
 
-# 非消费查询与统计
+# 非消费查询与统计（stats shows all4 dirs: inbox/processing/archive/_corrupt）
 {{WORKER_SCRIPT}} mailbox peek --session {{SESSION_ID}} --agent {{WORKER_ID}} [--json]
 {{WORKER_SCRIPT}} mailbox stats --session {{SESSION_ID}} --agent {{WORKER_ID}}
 {{WORKER_SCRIPT}} mailbox clear --session {{SESSION_ID}} --agent {{WORKER_ID}}
@@ -131,7 +131,7 @@ SourceAnalysis 与 ClosedSourceReverse Worker 在完成前必须复核符号、�
 - **Clock skew**：按 inbox 可见顺序处理；`created_at` 与文件名时间仅供诊断。发现明显偏差可 NOTICE `CLOCK_SKEW`，不能改时间戳。
 - **Unknown recipient**：先运行 `mailbox-roster` 验证，发送失败不得自行创建目录或换一个相似 ID。
 - **Status 写入失败**：保留 artifact，向 Manager 发 NOTICE；仍失败则停止扩展，避免出现"工作继续但状态不可见"。
-- **Crash recovery**：发现 processing/ 中有过期消息，运行 `mailbox recover-stale` 自动恢复；不手移文件。
+- **Crash recovery**：发现 `processing/` 中有过期消息（超过 300s lease），运行 `mailbox recover-stale` 自动将过期 claim 放回 inbox；`mailbox stats` 显示 `processing` 非零时应立即排查。不手移文件。
 
 ## Prevention Rules
 
@@ -139,7 +139,7 @@ SourceAnalysis 与 ClosedSourceReverse Worker 在完成前必须复核符号、�
 - 永远验证 `--to`；只写收件人 inbox，永远不写别人的 status/archive。
 - 两阶段消费：`mailbox read`（inbox→processing）→ 处理 → `mailbox finalize`（processing→archive）；`mailbox release` 用于放回；`mailbox recover-stale` 用于崩溃恢复。
 - 远程 SSH Worker 不使用 send-keys 与任何参与方通信；Manager/peer 通信完全走 mailbox，活跃度完全读 status.json。
-- 不覆盖已发送消息，不复用文件名/msg_id，不恢复 relay/cursor/ack。
+- 不覆盖已发送消息，不复用文件名/msg_id。
 - 不用 mailbox 消息代替 artifact；不把大文件或敏感原文塞入 body。
 - 不用 capture-pane、terminal echo 或推测表示完成；发送 REPORT 并更新 status。
 
@@ -149,6 +149,14 @@ SourceAnalysis 与 ClosedSourceReverse Worker 在完成前必须复核符号、�
 
 ## Legacy (v1)
 
-v1 使用 control envelope、B-plane ACK/DONE/BLOCKED、`mailbox/outbox`→relay→`mailbox/inbox`、cursor/unread/mark-read。兼容旧 Manager 时，以下命令仍可使用但均为 LEGACY：`event-emit ACK/DONE/BLOCKED/WORKING`、`mailbox-send`、`mailbox-check`、`mailbox-relay`、control-envelope TASK、queue auto-drain。v1 架构不得带入新的 v2 TASK。
+v1 架构使用以下已废弃概念，全部由 v2 `status.json` + direct inbox 取代：
+
+- **control envelope**（A-plane）：旧 control/steering 下行指令，v2 改用 `mailbox read`
+- **B-plane**：旧 event-emit 生命周期事件（ACK/DONE/BLOCKED/WORKING），v2 改用 `status.json`
+- **mailbox/outbox → relay daemon → mailbox/inbox**：旧消息中继路径，v2 改用 direct inbox
+- **cursor / unread / mark-read**：旧消息消费状态跟踪，v2 改用 `mailbox read`/`mailbox finalize` 两阶段消费
+- **mailbox-check**：旧消息查询，v2 改用 `mailbox read`（非消费用 `mailbox peek`）
+
+兼容旧 Manager 时，以下命令仍可使用但均为 LEGACY：`event-emit ACK/DONE/BLOCKED/WORKING`、`mailbox-send`、`mailbox-check`、`mailbox-relay`、control-envelope TASK、queue auto-drain。v1 架构不得带入新的 v2 TASK。
 
 若收到 v1 envelope，按旧请求完成其 ACK/terminal event，同时仍维护 v2 `status.json` 并向 Manager v2 inbox 发 REPORT；不得为兼容而让新消息重新走 relay。

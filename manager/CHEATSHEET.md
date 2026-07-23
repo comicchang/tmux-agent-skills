@@ -34,7 +34,7 @@ mailbox release --session <session-id> --agent <agent-id> --msg-id <id>
 # 崩溃恢复：过期 processing→inbox
 mailbox recover-stale --session <session-id> --agent <agent-id>
 
-# 计数与清理
+# 计数与清理（stats shows all4 dirs: inbox/processing/archive/_corrupt）
 mailbox stats --session <session-id> --agent <agent-id>
 mailbox clear --session <session-id> --agent <agent-id>
 
@@ -43,7 +43,7 @@ tmux send-keys -t <target> -l -- "MAILBOX_PENDING; check v2 inbox"
 tmux send-keys -t <target> C-m
 ```
 
-目录：`_mailbox/<session_id>/<agent>/{inbox,processing,archive,_corrupt}/`；外加 `_mailbox/<session_id>/session.json`。Worker→Manager、Worker→Worker、Manager→Worker 正式内容全部 direct inbox；无 relay daemon、outbox、cursor。
+目录：`_mailbox/<session_id>/<agent>/{inbox,processing,archive,_corrupt}/`；外加 `_mailbox/<session_id>/session.json`。Worker→Manager、Worker→Worker、Manager→Worker 正式内容全部 direct inbox。
 8 个必填字段：`session_id`、`from`、`to`、`subject`、`body`、`kind`、`msg_id`、`created_at`；3 个可选关联字段：`reply_to`、`run_id`、`request_id`。
 7 种 kind：TASK, REPORT, PROGRESS, EVIDENCE, QUESTION, RESPONSE, NOTICE。
 竞态保护：`mailbox read`（inbox→processing，auto-claim）→ 处理 → `mailbox finalize`（processing→archive）；`mailbox release` 回放；`mailbox recover-stale` 崩溃恢复。
@@ -112,7 +112,11 @@ python3 scripts/tmux_worker.py mailbox status --session <id> --agent <id> \
 
 ## Legacy (v1)
 
-v1 使用 control envelope、B-plane ACK/DONE/BLOCKED、`mailbox/outbox`→relay→`mailbox/inbox`、cursor/unread/mark-read。
+v1 使用以下已废弃概念，全部由 v2 `status.json` + direct inbox 取代：
+- **control envelope**（A-plane）：旧 control/steering 下行指令封装
+- **B-plane**：旧 event-emit 生命周期事件（ACK/DONE/BLOCKED/WORKING）
+- **mailbox/outbox → relay daemon → mailbox/inbox**：旧消息中继路径
+- **cursor / unread / mark-read**：旧消息消费状态跟踪
 
 ```bash
 python3 scripts/tmux_worker.py request --worker <id> --task-file t.txt --yes

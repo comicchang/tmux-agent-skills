@@ -18,12 +18,8 @@ description: tmux-agent-manager v3 — 薄编排契约
 | Manager→Worker | v2 mailbox direct inbox | 正式 TASK、补充材料、需留痕的指令 |
 | Manager→Worker | `tmux send-keys` | 只发本地 Worker 的 `MAILBOX_PENDING` 或短 steering；不承载正式任务正文 |
 | Worker→Manager | v2 mailbox direct inbox | `REPORT`、`PROGRESS`、`QUESTION`、`NOTICE` |
-| Worker→Worker | v2 mailbox direct inbox | peer 问答、证据与复核请求；Syncthing 直接同步，无 relay |
+| Worker→Worker | v2 mailbox direct inbox | peer 问答、证据与复核请求；Syncthing 直接同步 |
 | Worker→all observers | `_mailbox/<session>/<agent>/status.json` | `IDLE/BUSY/DONE/BLOCKED`、当前任务、最后结论 |
-
-B-plane 事件仍可用于兼容旧 Worker、事件审计和启动诊断，但**不再是 Manager 获取 Worker 状态的唯一来源**。当前工作状态首先读 `status.json`，不得回退到 terminal 文本或 capture-pane。
-
-历史兼容术语：A-plane 是旧 control/steering 下行，B-plane 是旧 event-emit 生命周期事件，C-plane 是消息通道；v2 direct inbox 取代 C-plane，但保留这些术语帮助审计旧记录。
 
 通知策略按部署位置区分：本地 Worker（ios-re、ios-shader、ohos-bin）可收到 `send-keys` 作为辅助唤醒，但 mailbox 才是可靠 payload；远程 SSH Worker（aosp、hyperos、ohos）无法可靠接收 Manager 的 send-keys，若没有 runner adapter，必须在 task start/end、阶段边界和长工具返回后主动轮询自己的 inbox。启用 framework-neutral adapter 时由 standalone CLI 完成 watch/peek→inject/status_update。Manager 对所有 Worker 都轮询 `status.json` 与 inbox 计数；send-keys 成功不代表远程送达。
 
@@ -68,7 +64,7 @@ scripts/tmux_worker.py mailbox finalize \
 
 # 非消费查看、统计与清理
 scripts/tmux_worker.py mailbox peek --session <session-id> --agent manager [--json]
-scripts/tmux_worker.py mailbox stats --session <session-id> --agent manager
+scripts/tmux_worker.py mailbox stats --session <session-id> --agent manager  # shows all4 dirs: inbox/processing/archive/_corrupt
 scripts/tmux_worker.py mailbox clear --session <session-id> --agent manager
 
 # 崩溃恢复：将过期 processing 消息放回 inbox
@@ -146,7 +142,15 @@ Marker 与 pane liveness 仍用于启动：`PANE_ALIVE → SHELL_READY → CWD_V
 
 ## Legacy (v1)
 
-v1 使用 control envelope、B-plane ACK/DONE/BLOCKED、`mailbox/outbox`→relay→`mailbox/inbox`、cursor/unread/mark-read。下列命令仅供尚未迁移的 Worker 过渡使用：`request`、`request-role`、`batch-request`、`event-emit`、`event-wait`、`mailbox-send`、`mailbox-check`、`mailbox-relay`、`manager-poll`。v1 架构不得用于新的 v2 工作流。
+v1 架构使用以下已废弃概念，全部由 v2 `status.json` + direct inbox 取代：
+
+- **control envelope**（A-plane）：旧 control/steering 下行指令封装
+- **B-plane**：旧 event-emit 生命周期事件（ACK/DONE/BLOCKED/WORKING），曾是 Manager 获取 Worker 状态的唯一来源
+- **C-plane**：旧消息通道，被 v2 direct inbox 取代
+- **mailbox/outbox → relay → mailbox/inbox**：旧消息中继路径
+- **cursor / unread / mark-read**：旧消息消费状态跟踪
+
+下列命令仅供尚未迁移的 Worker 过渡使用，不得用于新的 v2 工作流：`request`、`request-role`、`batch-request`、`event-emit`、`event-wait`、`mailbox-send`、`mailbox-check`、`mailbox-relay`、`manager-poll`。
 
 兼容期若 v1 Worker 仍发事件，Manager 可审计事件并读取其旧 outbox，但不得把 v1 relay daemon 当成 v2 前提；迁移完成后由 v2 `status.json` + direct inbox 接管。
 ---

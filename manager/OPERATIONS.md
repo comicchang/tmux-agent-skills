@@ -16,7 +16,7 @@ _mailbox/<session_id>/
   <agent-id>/status.json
 ```
 
-Syncthing 同步共享根。所有参与者直接写**收件人** inbox；没有 outbox、relay daemon、cursor 或已读 ACK 文件。`~/.drafts/tmux-workers/<id>/ipc` 与事件文件仅保留给启动诊断和 v1 兼容。
+Syncthing 同步共享根。所有参与者直接写**收件人** inbox。`~/.drafts/tmux-workers/<id>/ipc` 保留给启动诊断。
 
 `processing/` 提供竞态保护：Agent 通过 `mailbox read` 自动声明消息（inbox→processing，按 owner+lease），处理后 `mailbox finalize` 验证 owner 并归档（processing→archive）；`mailbox release` 放回 inbox。Manager 监控 `processing/` 计数诊断卡住任务。`mailbox recover-stale` 将过期 processing（300s lease）自动恢复到 inbox，用于崩溃恢复。
 
@@ -90,7 +90,7 @@ scripts/tmux_worker.py mailbox finalize \
 scripts/tmux_worker.py mailbox release \
   --session <session-id> --agent manager --msg-id <id>
 
-# 统计与清理
+# 统计（shows all4 dirs: inbox/processing/archive/_corrupt）与清理
 scripts/tmux_worker.py mailbox stats --session <session-id> --agent manager
 scripts/tmux_worker.py mailbox clear --session <session-id> --agent manager
 
@@ -137,7 +137,7 @@ Manager 监控循环：
 
 - Worker 在 plugin 模式下由 plugin 在安全边界 peek/inject/status-update；Worker 仍审阅注入内容。manual fallback 才需要在任务开始、主要阶段、final REPORT 前、终态后 `mailbox read`；本地看到 `MAILBOX_PENDING` 可立即检查，远程必须完全依赖 mailbox + status.json，不能使用 send-keys。
 - Manager 在派发前、等待循环、看到状态终态、处理每封消息后 `mailbox read` 自己的 inbox；inbox count 只作 pending 提示，不改 status schema。
-- 一次只处理一封（read→process→finalize），处理完成后再 read；这样不需要 cursor，也不会因一次巨大 JSON 数组漏掉中间消息。
+- 一次只处理一封（read→process→finalize），处理完成后再 read；消息按到达顺序逐个处理，不会因一次巨大 JSON 数组漏掉中间消息。
 - 外部工具不可中断时，在调用前后轮询；不要用固定 sleep 替代检查。
 - 业务顺序不依赖文件名或发送方时钟；按 inbox mtime/实际到达读取。
 
@@ -165,11 +165,11 @@ Manager 不把 status DONE 当作 artifact 已验证；必须 read REPORT、验�
 
 ### Missing recipient / sync failure
 
-先 `mailbox-roster`，再确认目标 inbox 已同步。发送失败不 fallback 到相似 worker、手写目录或旧 relay。Worker 无法写 status/REPORT 时保存 artifact，并使用短 send-keys 通知 `MAILBOX_SYNC_FAILED`，随后停止扩展。
+先 `mailbox-roster`，再确认目标 inbox 已同步。发送失败不 fallback 到相似 worker 或手写目录。Worker 无法写 status/REPORT 时保存 artifact，并使用短 send-keys 通知 `MAILBOX_SYNC_FAILED`，随后停止扩展。
 
 ### Crash recovery
 
-`mailbox recover-stale` 扫描 processing/，将超过 300s lease 的消息重新放回 inbox。Manager 与 Worker 在启动和发现 processing 计数异常时应主动运行。
+`mailbox recover-stale` 扫描 `processing/`，将超过 300s lease 的消息重新放回 inbox。Manager 与 Worker 在启动和发现 `processing` 计数异常时应主动运行；`mailbox stats` 显示 `processing` 非零时应立即排查。不手移文件。
 
 ## 8. 重新初始化与恢复
 
@@ -182,7 +182,7 @@ Worker 不遵守 v2（手写 JSON、未 poll、未维护 status）时先轻量 `
 - CLI 原子写入；永远不手写 mailbox/status JSON。
 - `mailbox-roster` 验证收件人；不猜、不 swap。
 - formal TASK 走 mailbox send；send-keys 只 wake/steering。
-- Worker/Manager 都按边界轮询；不用 relay daemon、cursor 或 capture-pane。
+- Worker/Manager 都按边界轮询；不用 capture-pane 判断状态。
 - 不覆盖消息；纠正发新消息 + `reply_to`。
 - archive 只在确认处理完成后 clear；`_corrupt/` 不自动删除。
 - status 只四字段；完整结论只放 REPORT/artifact。
@@ -190,7 +190,14 @@ Worker 不遵守 v2（手写 JSON、未 poll、未维护 status）时先轻量 `
 
 ## Legacy (v1)
 
-v1 使用 control envelope、B-plane ACK/DONE/BLOCKED、`mailbox/outbox`→relay→`mailbox/inbox`、cursor/unread/mark-read。以下命令保留给尚未迁移的 Worker：
+v1 架构使用以下已废弃概念，全部由 v2 `status.json` + direct inbox 取代：
+
+- **control envelope**（A-plane）：旧 control/steering 下行指令封装
+- **B-plane**：旧 event-emit 生命周期事件（ACK/DONE/BLOCKED/WORKING）
+- **mailbox/outbox → relay daemon → mailbox/inbox**：旧消息中继路径
+- **cursor / unread / mark-read / 已读 ACK**：旧消息消费状态跟踪
+
+以下命令保留给尚未迁移的 Worker，新的 v2 消息和 TASK 不得经过 v1 relay：
 
 ```bash
 scripts/tmux_worker.py request --worker <id> --task-file task.txt
@@ -202,5 +209,3 @@ scripts/tmux_worker.py mailbox-send ...
 scripts/tmux_worker.py mailbox-check ...
 scripts/tmux_worker.py mailbox-relay ...
 ```
-
-兼容期可读取这些记录做审计，但新的 v2 消息和 TASK 不得经过 v1 relay，也不得把 B-plane 恢复为唯一状态源。
