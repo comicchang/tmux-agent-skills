@@ -121,7 +121,7 @@ scripts/tmux_worker.py mailbox status --session <id> --agent <id> \
   --last-conclusion "previous task complete"
 ```
 
-文件固定四字段：`state`、`current_task`、`last_conclusion`、`updated_at`。state 仅允许 `IDLE/BUSY/DONE/BLOCKED`。Worker 在 TASK 开始写 BUSY，在 final REPORT 后写 DONE/BLOCKED。Manager 与 peer 只读，不修改。
+文件固定五字段：`state`、`current_task`、`last_conclusion`、`updated_at`（`session_id` 由路径隐含）。state 仅允许 `IDLE/BUSY/DONE/BLOCKED`。Worker 在 TASK 开始写 BUSY，在 final REPORT 后写 DONE/BLOCKED。Manager 与 peer 只读，不修改。
 
 Manager 监控循环：
 
@@ -185,7 +185,7 @@ Worker 不遵守 v2（手写 JSON、未 poll、未维护 status）时先轻量 `
 - Worker/Manager 都按边界轮询；不用 capture-pane 判断状态。
 - 不覆盖消息；纠正发新消息 + `reply_to`。
 - archive 只在确认处理完成后 clear；`_corrupt/` 不自动删除。
-- status 只四字段；完整结论只放 REPORT/artifact。
+- status 只五字段；完整结论只放 REPORT/artifact。
 - 两阶段消费：`mailbox read`→process→`mailbox finalize`；`mailbox release` 用于放回 inbox；`mailbox recover-stale` 用于崩溃恢复。
 
 ## Legacy (v1)

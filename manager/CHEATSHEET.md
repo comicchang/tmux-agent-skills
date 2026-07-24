@@ -81,7 +81,7 @@ python3 scripts/tmux_worker.py mailbox status --session <id> --agent <id> \
   --state BLOCKED --current-task "<task>" --last-conclusion "<brief reason>"
 ```
 
-`.mailbox/<session>/<agent>/status.json` **恰好四字段**：`state`、`current_task`、`last_conclusion`、`updated_at`。Manager 每 5 秒读 status；`BUSY` 不派新任务，`DONE/BLOCKED` 立即收取 Manager inbox 的 REPORT。`STALE` 只做诊断，不等于 IDLE。
+`.mailbox/<session>/<agent>/status.json` **恰好五字段**：`session_id`、`state`、`current_task`、`last_conclusion`、`updated_at`。Manager 每 5 秒读 status；`BUSY` 不派新任务，`DONE/BLOCKED` 立即收取 Manager inbox 的 REPORT。`STALE` 只做诊断，不等于 IDLE。
 
 ## Task headers
 

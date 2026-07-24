@@ -11,7 +11,7 @@ from pathlib import Path
 
 def resolve_root():
     return Path(os.environ.get("MAILBOX_ROOT") or
-                os.path.expanduser("~/Dropbox/logseq/pages/mi-docs/_mailbox"))
+                os.path.expanduser("~/Dropbox/logseq/pages/mi-docs/.mailbox"))
 
 
 def main(session_id: str, agent_id: str):
@@ -45,7 +45,7 @@ def main(session_id: str, agent_id: str):
 
     result = {"pending": len(files), "messages": summaries}
     json.dump(result, sys.stdout, ensure_ascii=False)
-    sys.exit(1 if files else 0)
+    sys.exit(0)  # messages found is success, not failure
 
 
 if __name__ == "__main__":
