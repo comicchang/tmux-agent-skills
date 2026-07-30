@@ -76,7 +76,7 @@ tmux send-keys -t <target> C-m
 
 ```bash
 # 非消费查看
-scripts/tmux_worker.py mailbox peek --session <session-id> --agent manager [--json]
+mailbox peek --session <session-id> --agent manager
 
 # 消费一封消息：inbox→processing，按 owner+lease 自动声明
 scripts/tmux_worker.py mailbox read \

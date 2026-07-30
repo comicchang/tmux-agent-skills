@@ -27,7 +27,7 @@ Before dispatching or waiting for any Worker, Manager MUST initialize its own id
 3. Check the Manager inbox before declaring the Manager idle:
 
    ```bash
-   mailbox peek --session <actual-session-id> --agent manager [--json]
+   mailbox peek --session <actual-session-id> --agent manager
    ```
 
 4. If `pending` is greater than zero, process every pre-existing REPORT/NOTICE before declaring IDLE: use `mailbox read --session <actual-session-id> --agent manager --owner manager --json`, verify the report/artifact, then `mailbox finalize --session <actual-session-id> --agent manager --msg-id <id> --owner manager`; repeat until the inbox is empty. A failed peek or unreadable inbox is a startup failure, not an idle state.
@@ -119,7 +119,7 @@ mailbox finalize \
   --session <session-id> --agent manager --msg-id <id> --owner manager
 
 # 非消费查看、统计与清理
-mailbox peek --session <session-id> --agent manager [--json]
+mailbox peek --session <session-id> --agent manager
 mailbox stats --session <session-id> --agent manager  # shows all 4 dirs: inbox/processing/archive/_corrupt
 mailbox clear --session <session-id> --agent manager
 

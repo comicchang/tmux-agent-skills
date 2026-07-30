@@ -29,7 +29,7 @@ mailbox read --session <session-id> --agent <agent-id> --owner <agent-id> [--jso
 mailbox finalize --session <session-id> --agent <agent-id> --msg-id <id> --owner <agent-id>
 
 # 放回 inbox（不处理时）
-mailbox release --session <session-id> --agent <agent-id> --msg-id <id>
+mailbox release --session <session-id> --agent <agent-id> --msg-id <id> --owner <agent-id>
 
 # 崩溃恢复：过期 processing→inbox
 mailbox recover-stale --session <session-id> --agent <agent-id>
@@ -71,13 +71,13 @@ tmux send-keys -t <target> C-m
 
 ```bash
 # TASK 开始
-python3 scripts/tmux_worker.py mailbox status --session <id> --agent <id> \
+mailbox status --session <id> --agent <id> \
   --state BUSY --current-task "<one-line task>" --last-conclusion "<previous>"
 
 # TASK 成功/阻塞结束（先发 REPORT）
-python3 scripts/tmux_worker.py mailbox status --session <id> --agent <id> \
+mailbox status --session <id> --agent <id> \
   --state DONE --current-task "<task>" --last-conclusion "<brief result>"
-python3 scripts/tmux_worker.py mailbox status --session <id> --agent <id> \
+mailbox status --session <id> --agent <id> \
   --state BLOCKED --current-task "<task>" --last-conclusion "<brief reason>"
 ```
 

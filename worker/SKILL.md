@@ -32,7 +32,7 @@ Manager 仍负责 shell、cwd 与 agent 启动。INIT 必须明确提供实际�
 
 ### Already initialized
 
-若 `.mailbox/<session-id>/<worker-id>/status.json` 已存在且 `state` 为 `IDLE`，说明 INIT 已完成。此时新的 INIT 是 **NO-OP**：不要重新读取 skills、不要重写 IDLE、不要再次发送或消费 INIT；只执行 `mailbox peek --session <session-id> --agent <worker-id> [--json]`，然后按正常 polling contract 用 `mailbox read` 处理新的 TASK。
+若 `.mailbox/<session-id>/<worker-id>/status.json` 已存在且 `state` 为 `IDLE`，说明 INIT 已完成。此时新的 INIT 是 **NO-OP**：不要重新读取 skills、不要重写 IDLE、不要再次发送或消费 INIT；只执行 `mailbox peek --session <session-id> --agent <worker-id>`，然后按正常 polling contract 用 `mailbox read` 处理新的 TASK。
 
 ## INIT Handshake
 
@@ -96,7 +96,7 @@ mailbox send \
   --kind REPORT --subject "<short result>" --body "<conclusion and artifact refs>"
 
 # 非消费查询与统计（stats shows all 4 dirs: inbox/processing/archive/_corrupt）
-mailbox peek --session <session-id> --agent <worker-id> [--json]
+mailbox peek --session <session-id> --agent <worker-id>
 mailbox stats --session <session-id> --agent <worker-id>
 mailbox clear --session <session-id> --agent <worker-id>
 
