@@ -524,7 +524,7 @@ def cmd_stats(args):
     ad = agent_dir(root, args.session, args.agent)
     for d in ["inbox", "processing", "archive", "_corrupt"]:
         p = ad / d
-        c = len(list(p.glob("*.json"))) if p.exists() else 0
+        c = len(list_messages(p))
         print(f"{d}: {c}")
 
 
